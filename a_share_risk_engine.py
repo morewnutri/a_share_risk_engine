@@ -268,6 +268,8 @@ class DataHub:
         return any(x in msg for x in transient_tokens)
 
     def _call_with_retry(self, label: str, fn: Callable[[], Any], retries: int = NETWORK_RETRIES) -> Any:
+        if retries < 1:
+            retries = 1
         last_error = None
         for i in range(retries):
             try:
@@ -456,6 +458,8 @@ class DataHub:
                                          f"AKShare:stock_zh_index_daily_em({symbol})")
                                 added_any = True
                             success = added_any
+                        else:
+                            self.warnings.append(f"A股指数历史缺日期列: {key}({symbol})")
                 if success:
                     continue
                 if bs_login_ok and key in BAOSTOCK_INDEX_SYMBOLS:

@@ -43,6 +43,17 @@ python a_share_risk_engine.py
 - `output/decision_tree.png`（Graphviz可用时）
 - `state/a_market_snapshot.csv`
 
+## 数据源与回退链（关键因子）
+
+- A股指数/成交额：优先 `AKShare:stock_zh_index_daily_em`，失败时回退 `baostock:query_history_k_data_plus`
+- A股横截面宽度：优先 `AKShare:stock_zh_a_spot_em`，失败时回退 `AKShare:stock_zh_a_spot`
+- 海外市场/汇率/商品：`yfinance`，并对 HSTECH/A50 使用多 ticker 回退链
+- 美债/信用/Fed：`FRED`（未配置 `FRED_API_KEY` 时会明确告警并降低置信度）
+
+程序会区分：
+- `missing`：数据缺失（无值）
+- `stale`：数据存在但超出最大允许滞后天数（会告警并下调置信度）
+
 ## 评分逻辑
 
 每个因子映射为：

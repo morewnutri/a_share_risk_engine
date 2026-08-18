@@ -3,4 +3,5 @@ numpy>=1.24
 requests>=2.31
 yfinance>=0.2
 akshare
+baostock
 graphviz>=0.21

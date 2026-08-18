@@ -23,10 +23,11 @@ import argparse
 import json
 import math
 import os
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable, Set
 
 import numpy as np
 import pandas as pd
@@ -42,31 +43,36 @@ try:
 except Exception:
     ak = None
 
+try:
+    import baostock as bs
+except Exception:
+    bs = None
+
 DEFAULT_HISTORY_DAYS = 220
 STATE_DIR = Path("state")
 OUTPUT_DIR = Path("output")
 MANUAL_FILE = Path("manual_overrides.json")
 
-YF_TICKERS = {
-    "SSE": "000001.SS",
-    "CSI300": "000300.SS",
-    "CSI1000": "000852.SS",
-    "CHINEXT": "399006.SZ",
-    "STAR50": "000688.SS",
-    "HSI": "^HSI",
-    "HSTECH": "^HSTECH",
-    "A50": "XIN9.SI",
-    "VIX": "^VIX",
-    "NASDAQ100": "^NDX",
-    "SOX": "^SOX",
-    "DXY": "DX-Y.NYB",
-    "NIKKEI": "^N225",
-    "KOSPI": "^KS11",
-    "USDCNH": "CNH=X",
-    "USDJPY": "JPY=X",
-    "COPPER": "HG=F",
-    "OIL": "CL=F",
-    "IRON_ORE": "TIO=F",
+YF_TICKER_CANDIDATES = {
+    "SSE": ["000001.SS"],
+    "CSI300": ["000300.SS"],
+    "CSI1000": ["000852.SS"],
+    "CHINEXT": ["399006.SZ"],
+    "STAR50": ["000688.SS"],
+    "HSI": ["^HSI"],
+    "HSTECH": ["^HSTECH", "3033.HK", "3067.HK"],
+    "A50": ["XIN9.SI", "2823.HK"],
+    "VIX": ["^VIX"],
+    "NASDAQ100": ["^NDX"],
+    "SOX": ["^SOX"],
+    "DXY": ["DX-Y.NYB"],
+    "NIKKEI": ["^N225"],
+    "KOSPI": ["^KS11"],
+    "USDCNH": ["CNH=X"],
+    "USDJPY": ["JPY=X"],
+    "COPPER": ["HG=F"],
+    "OIL": ["CL=F"],
+    "IRON_ORE": ["TIO=F"],
 }
 
 AK_INDEX_SYMBOLS = {
@@ -75,6 +81,14 @@ AK_INDEX_SYMBOLS = {
     "CSI1000": "sh000852",
     "CHINEXT": "sz399006",
     "STAR50": "sh000688",
+}
+
+BAOSTOCK_INDEX_SYMBOLS = {
+    "SSE": "sh.000001",
+    "CSI300": "sh.000300",
+    "CSI1000": "sh.000852",
+    "CHINEXT": "sz.399006",
+    "STAR50": "sh.000688",
 }
 
 FRED_SERIES = {
@@ -98,6 +112,10 @@ MAX_AGE_DAYS = {
     "manual": 7,
 }
 
+NETWORK_RETRIES = 3
+NETWORK_BACKOFF_SEC = 1.0
+DEFAULT_REQUEST_TIMEOUT = (5, 20)
+
 @dataclass
 class DataSeries:
     key: str
@@ -116,6 +134,7 @@ class FactorResult:
     detail: str
     source: str
     missing: bool = False
+    stale: bool = False
 
     @property
     def contribution(self) -> Optional[float]:
@@ -133,6 +152,8 @@ class EngineResult:
     risk_level: str
     resonance_adjustment: float
     missing_critical: List[str]
+    stale_critical: List[str]
+    stale_keys: List[str]
     warnings: List[str]
     factors: List[FactorResult]
     decision_path: List[str]
@@ -237,24 +258,78 @@ class DataHub:
     def source(self, key: str) -> str:
         return self.series[key].source if key in self.series else "MISSING"
 
+    def _is_transient_error(self, e: Exception) -> bool:
+        msg = str(e).lower()
+        transient_tokens = [
+            "timed out", "timeout", "remote end closed", "remotedisconnected",
+            "connection aborted", "connection reset", "temporarily unavailable",
+            "429", "503", "504", "502", "too many requests"
+        ]
+        return any(x in msg for x in transient_tokens)
+
+    def _call_with_retry(self, label: str, fn: Callable[[], Any], retries: int = NETWORK_RETRIES) -> Any:
+        if retries < 1:
+            retries = 1
+        last_error = None
+        for i in range(retries):
+            try:
+                return fn()
+            except Exception as e:
+                last_error = e
+                if i >= retries - 1 or not self._is_transient_error(e):
+                    break
+                time.sleep(NETWORK_BACKOFF_SEC * (i + 1))
+        self.warnings.append(f"{label} 获取失败: {last_error}")
+        return None
+
+    @staticmethod
+    def _max_age_for_source(src: str) -> int:
+        src = src.lower()
+        if "fred" in src:
+            return MAX_AGE_DAYS["fred"]
+        if "manual" in src:
+            return MAX_AGE_DAYS["manual"]
+        if "snapshot" in src:
+            return MAX_AGE_DAYS["snapshot"]
+        if "akshare" in src and ("macro" in src or "bond" in src):
+            return MAX_AGE_DAYS["ak_macro"]
+        return MAX_AGE_DAYS["market"]
+
+    def get_stale_keys(self) -> Set[str]:
+        out = set()
+        now = pd.Timestamp.now().normalize()
+        for key, ds in self.series.items():
+            if ds.last_date is None:
+                continue
+            last = pd.Timestamp(ds.last_date)
+            if last.tzinfo is not None:
+                last = last.tz_convert(None)
+            age = (now - last.normalize()).days
+            if age > self._max_age_for_source(ds.source):
+                out.add(key)
+        return out
+
     def fetch_yfinance(self) -> None:
         if yf is None:
             self.warnings.append("未安装 yfinance：海外指数/汇率/商品等自动行情将缺失。")
             return
         end = datetime.now().date() + timedelta(days=1)
         start = end - timedelta(days=self.history_days * 2)
-        for key, ticker in YF_TICKERS.items():
-            try:
-                df = yf.download(
-                    ticker,
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
+        for key, tickers in YF_TICKER_CANDIDATES.items():
+            ok = False
+            for ticker in tickers:
+                df = self._call_with_retry(
+                    f"yfinance {key}({ticker})",
+                    lambda t=ticker: yf.download(
+                        t,
+                        start=start.isoformat(),
+                        end=end.isoformat(),
+                        auto_adjust=False,
+                        progress=False,
+                        threads=False,
+                    ),
                 )
                 if df is None or df.empty:
-                    self.warnings.append(f"yfinance 无数据: {key} ({ticker})")
                     continue
                 if isinstance(df.columns, pd.MultiIndex):
                     close = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
@@ -263,8 +338,12 @@ class DataHub:
                 else:
                     close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
                 self.add(key, close, f"Yahoo Finance via yfinance ({ticker})")
-            except Exception as e:
-                self.warnings.append(f"yfinance 获取失败 {key}({ticker}): {e}")
+                ok = True
+                if len(tickers) > 1 and ticker != tickers[0]:
+                    self.warnings.append(f"yfinance 主ticker不可用，{key} 已回退到 {ticker}")
+                break
+            if not ok:
+                self.warnings.append(f"yfinance 无数据: {key} ({', '.join(tickers)})")
 
     def fetch_fred(self) -> None:
         api_key = os.getenv("FRED_API_KEY", "").strip()
@@ -278,8 +357,9 @@ class DataHub:
         start = (datetime.now().date() - timedelta(days=self.history_days * 2)).isoformat()
         url = "https://api.stlouisfed.org/fred/series/observations"
         for key, sid in FRED_SERIES.items():
-            try:
-                r = requests.get(
+            r = self._call_with_retry(
+                f"FRED:{sid}",
+                lambda sid=sid: requests.get(
                     url,
                     params={
                         "series_id": sid,
@@ -288,8 +368,12 @@ class DataHub:
                         "observation_start": start,
                         "sort_order": "asc",
                     },
-                    timeout=20,
-                )
+                    timeout=DEFAULT_REQUEST_TIMEOUT,
+                ),
+            )
+            if r is None:
+                continue
+            try:
                 r.raise_for_status()
                 obs = r.json().get("observations", [])
                 rows = [(x["date"], float(x["value"])) for x in obs if x.get("value") not in (None, ".")]
@@ -308,11 +392,14 @@ class DataHub:
         if ak is None:
             self.warnings.append("未安装 AKShare：A股横截面、融资余额、中国10Y、BOJ等数据将缺失。")
             return
+        start = (datetime.now().date() - timedelta(days=self.history_days * 2)).strftime("%Y%m%d")
+        df = self._call_with_retry(
+            "AKShare bond_zh_us_rate",
+            lambda: ak.bond_zh_us_rate(start_date=start),
+        )
+        if df is None or df.empty:
+            return
         try:
-            start = (datetime.now().date() - timedelta(days=self.history_days * 2)).strftime("%Y%m%d")
-            df = ak.bond_zh_us_rate(start_date=start)
-            if df is None or df.empty:
-                return
             date_col = self._find_col(df, ["日期", "date"])
             if not date_col:
                 self.warnings.append("bond_zh_us_rate 找不到日期列。")
@@ -331,41 +418,112 @@ class DataHub:
 
     def fetch_a_index_history(self) -> None:
         """用 AKShare 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。"""
-        if ak is None:
+        if ak is None and bs is None:
             return
+        bs_login_ok = False
+        if bs is not None:
+            lg = bs.login()
+            if getattr(lg, "error_code", "1") == "0":
+                bs_login_ok = True
+            else:
+                self.warnings.append(f"baostock 登录失败: {getattr(lg, 'error_msg', 'unknown')}")
         for key, symbol in AK_INDEX_SYMBOLS.items():
+            success = False
             try:
-                df = ak.stock_zh_index_daily_em(symbol=symbol)
-                if df is None or df.empty:
-                    self.warnings.append(f"A股指数历史为空: {key}({symbol})")
+                if ak is not None:
+                    df = self._call_with_retry(
+                        f"AKShare {key}({symbol})",
+                        lambda sym=symbol: ak.stock_zh_index_daily_em(symbol=sym),
+                    )
+                    if df is not None and not df.empty:
+                        date_col = self._find_col(df, ["date", "日期"])
+                        close_col = self._find_col(df, ["close", "收盘"])
+                        amount_col = self._find_col(df, ["amount", "成交额"])
+                        volume_col = self._find_col(df, ["volume", "成交量"])
+                        if date_col:
+                            idx = pd.to_datetime(df[date_col], errors="coerce")
+                            added_any = False
+                            if close_col and key not in self.series:
+                                self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
+                                         f"AKShare:stock_zh_index_daily_em({symbol})")
+                                added_any = True
+                            if amount_col:
+                                self.add(key+"_INDEX_AMOUNT",
+                                         pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
+                                         f"AKShare:stock_zh_index_daily_em({symbol})")
+                                added_any = True
+                            if volume_col:
+                                self.add(key+"_INDEX_VOLUME",
+                                         pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
+                                         f"AKShare:stock_zh_index_daily_em({symbol})")
+                                added_any = True
+                            success = added_any
+                        else:
+                            self.warnings.append(f"A股指数历史缺日期列: {key}({symbol})")
+                if success:
                     continue
-                date_col = self._find_col(df, ["date", "日期"])
-                close_col = self._find_col(df, ["close", "收盘"])
-                amount_col = self._find_col(df, ["amount", "成交额"])
-                volume_col = self._find_col(df, ["volume", "成交量"])
-                if not date_col:
-                    self.warnings.append(f"A股指数历史缺日期列: {key}")
-                    continue
-                idx = pd.to_datetime(df[date_col], errors="coerce")
-                if close_col and key not in self.series:
-                    self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if amount_col:
-                    self.add(key+"_INDEX_AMOUNT",
-                             pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if volume_col:
-                    self.add(key+"_INDEX_VOLUME",
-                             pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
+                if bs_login_ok and key in BAOSTOCK_INDEX_SYMBOLS:
+                    code = BAOSTOCK_INDEX_SYMBOLS[key]
+                    end_date = datetime.now().date()
+                    start_date = end_date - timedelta(days=self.history_days * 2)
+                    rs = self._call_with_retry(
+                        f"baostock {key}({code})",
+                        lambda c=code, sd=start_date, ed=end_date: bs.query_history_k_data_plus(
+                            c,
+                            "date,close,volume,amount",
+                            start_date=sd.isoformat(),
+                            end_date=ed.isoformat(),
+                            frequency="d",
+                            adjustflag="3",
+                        ),
+                    )
+                    if rs is not None and getattr(rs, "error_code", "1") == "0":
+                        rows = []
+                        while rs.next():
+                            rows.append(rs.get_row_data())
+                        if rows:
+                            dfb = pd.DataFrame(rows, columns=["date", "close", "volume", "amount"])
+                            idx = pd.to_datetime(dfb["date"], errors="coerce")
+                            added_any = False
+                            if key not in self.series:
+                                self.add(key, pd.Series(pd.to_numeric(dfb["close"], errors="coerce").values, index=idx),
+                                         f"baostock:query_history_k_data_plus({code})")
+                                added_any = True
+                            if key+"_INDEX_AMOUNT" not in self.series:
+                                self.add(key+"_INDEX_AMOUNT",
+                                         pd.Series(pd.to_numeric(dfb["amount"], errors="coerce").values, index=idx),
+                                         f"baostock:query_history_k_data_plus({code})")
+                                added_any = True
+                            if key+"_INDEX_VOLUME" not in self.series:
+                                self.add(key+"_INDEX_VOLUME",
+                                         pd.Series(pd.to_numeric(dfb["volume"], errors="coerce").values, index=idx),
+                                         f"baostock:query_history_k_data_plus({code})")
+                                added_any = True
+                            if added_any:
+                                success = True
+                                self.warnings.append(f"{key} 使用 baostock 回退数据源。")
             except Exception as e:
                 self.warnings.append(f"A股指数历史获取失败 {key}({symbol}): {e}")
+            if not success:
+                self.warnings.append(f"A股指数历史仍缺失: {key}")
+        if bs_login_ok:
+            try:
+                bs.logout()
+            except Exception:
+                pass
 
     def fetch_a_share_snapshot(self) -> None:
         if ak is None:
             return
         try:
-            df = ak.stock_zh_a_spot_em()
+            source = None
+            df = self._call_with_retry("AKShare stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em())
+            if df is not None and not df.empty:
+                source = "AKShare:stock_zh_a_spot_em"
+            elif hasattr(ak, "stock_zh_a_spot"):
+                df = self._call_with_retry("AKShare stock_zh_a_spot", lambda: ak.stock_zh_a_spot())
+                if df is not None and not df.empty:
+                    source = "AKShare:stock_zh_a_spot"
             if df is None or df.empty:
                 self.warnings.append("A股实时横截面为空。")
                 return
@@ -393,14 +551,15 @@ class DataHub:
                 total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
 
             now = pd.Timestamp.now().normalize()
-            self.add("A_BREADTH", pd.Series([adv], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_DECLINERS", pd.Series([dec], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_STRONG3", pd.Series([strong], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_WEAK3", pd.Series([weak], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), "AKShare:stock_zh_a_spot_em")
+            src = source or "AKShare:stock_zh_a_spot_em"
+            self.add("A_BREADTH", pd.Series([adv], index=[now]), src)
+            self.add("A_DECLINERS", pd.Series([dec], index=[now]), src)
+            self.add("A_STRONG3", pd.Series([strong], index=[now]), src)
+            self.add("A_WEAK3", pd.Series([weak], index=[now]), src)
+            self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), src)
+            self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), src)
             if not math.isnan(total_amount):
-                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), "AKShare:stock_zh_a_spot_em")
+                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), src)
 
             self._save_snapshot({
                 "date": now.strftime("%Y-%m-%d"),
@@ -556,17 +715,7 @@ class DataHub:
             if last.tzinfo is not None:
                 last = last.tz_convert(None)
             age = (now - last.normalize()).days
-            src = ds.source.lower()
-            if "fred" in src:
-                max_age = MAX_AGE_DAYS["fred"]
-            elif "manual" in src:
-                max_age = MAX_AGE_DAYS["manual"]
-            elif "snapshot" in src:
-                max_age = MAX_AGE_DAYS["snapshot"]
-            elif "akshare" in src and ("macro" in src or "bond" in src):
-                max_age = MAX_AGE_DAYS["ak_macro"]
-            else:
-                max_age = MAX_AGE_DAYS["market"]
+            max_age = self._max_age_for_source(ds.source)
             if age > max_age:
                 out.append(f"数据可能过期: {key} 最后日期={last.date()}, 已滞后 {age} 天, 来源={ds.source}")
         return out
@@ -575,10 +724,10 @@ def factor_missing(name, group, weight, source="MISSING", detail="缺失") -> Fa
     return FactorResult(name, group, weight, None, None, detail, source, True)
 
 def make_factor(name: str, group: str, weight: float, signal: Optional[float],
-                value: Optional[float], detail: str, source: str) -> FactorResult:
+                value: Optional[float], detail: str, source: str, stale: bool = False) -> FactorResult:
     if signal is None or value is None:
         return factor_missing(name, group, weight, source, detail)
-    return FactorResult(name, group, weight, clip(signal), float(value), detail, source, False)
+    return FactorResult(name, group, weight, clip(signal), float(value), detail, source, False, stale)
 
 class FactorEngine:
     def __init__(self, hub: DataHub):
@@ -902,6 +1051,52 @@ class FactorEngine:
             sig = None if x is None else piecewise_risk(x, [(-3,1),(-1.5,0.6),(-0.5,0.2),(0,0),(0.5,-0.1),(1.5,-0.2)])
             R.append(make_factor(name,"A股衍生品",w,sig,x,f"{key}={x}%；负值贴水偏风险",h.source(key)))
 
+        stale_keys = h.get_stale_keys()
+        factor_source_keys = {
+            "美债10Y绝对水平": ["US10Y"],
+            "美债10Y斜率/变化速度": ["US10Y"],
+            "美债10Y实际利率": ["US10Y_REAL"],
+            "美债2Y/Fed预期重定价": ["US2Y"],
+            "美联储政策利率方向": ["FED_FUNDS"],
+            "日本央行政策利率方向": ["BOJ_RATE"],
+            "美国高收益债OAS": ["HY_OAS"],
+            "离岸人民币USD/CNH": ["USDCNH"],
+            "美元指数DXY": ["DXY"],
+            "中美10Y国债利差": ["CN10Y", "US10Y"],
+            "VIX恐慌指数": ["VIX"],
+            "恒生科技": ["HSTECH"],
+            "恒生指数": ["HSI"],
+            "富时中国A50": ["A50"],
+            "纳斯达克100": ["NASDAQ100"],
+            "费城半导体SOX": ["SOX"],
+            "日经225": ["NIKKEI"],
+            "韩国KOSPI": ["KOSPI"],
+            "日元套息平仓风险": ["USDJPY"],
+            "铜价趋势": ["COPPER"],
+            "原油趋势": ["OIL"],
+            "铁矿石趋势": ["IRON_ORE"],
+            "沪深300自身趋势": ["CSI300"],
+            "创业板趋势": ["CHINEXT"],
+            "科创50趋势": ["STAR50"],
+            "中证1000趋势": ["CSI1000"],
+            "A股上涨家数比例": ["A_BREADTH"],
+            "A股强弱扩散差": ["A_WEAK3", "A_STRONG3"],
+            "A股近似跌停比例": ["A_LIMIT_DOWN_RATIO"],
+            "沪深300成交额确认": ["CSI300_INDEX_AMOUNT"],
+            "中证1000成交额确认": ["CSI1000_INDEX_AMOUNT"],
+            "创业板成交额确认": ["CHINEXT_INDEX_AMOUNT"],
+            "科创50成交额确认": ["STAR50_INDEX_AMOUNT"],
+            "A股成交额/MA20": ["A_TURNOVER_HIST"],
+            "融资余额变化": ["MARGIN_BALANCE"],
+            "主要宽基ETF 5日净流入": ["ETF_FLOW_5D_BN"],
+            "IF基差": ["IF_BASIS_PCT"],
+            "IC基差": ["IC_BASIS_PCT"],
+            "IM基差": ["IM_BASIS_PCT"],
+        }
+        for r in R:
+            keys = factor_source_keys.get(r.name, [])
+            r.stale = any(k in stale_keys for k in keys)
+
         return R
 
 def compute_resonance(f: Dict[str, Optional[float]]) -> Tuple[float, List[str]]:
@@ -980,12 +1175,18 @@ def score_engine(factors: List[FactorResult],
 
     weight_coverage = valid_weight / total_weight if total_weight else 0
     missing_critical = [k for k in sorted(CRITICAL_KEYS) if features.get(k) is None]
-    critical_coverage = 1.0 - len(missing_critical) / len(CRITICAL_KEYS)
+    stale_keys_set = hub.get_stale_keys()
+    stale_critical = [k for k in sorted(CRITICAL_KEYS) if k in stale_keys_set and features.get(k) is not None]
+    stale_keys = sorted(stale_keys_set)
+    critical_coverage = 1.0 - (len(missing_critical) + 0.5 * len(stale_critical)) / len(CRITICAL_KEYS)
+    critical_coverage = float(np.clip(critical_coverage, 0, 1))
     confidence = float(np.clip(100.0*(0.65*weight_coverage + 0.35*critical_coverage), 0, 100))
 
     warnings = list(hub.warnings) + hub.data_quality_warnings()
     if missing_critical:
         warnings.append("关键数据缺失: " + ", ".join(missing_critical))
+    if stale_critical:
+        warnings.append("关键数据过期(stale): " + ", ".join(stale_critical))
 
     action, path = rule_decision_tree(buy, sell, confidence, missing_critical, features)
     path = resonance_notes + path
@@ -1000,7 +1201,7 @@ def score_engine(factors: List[FactorResult],
     return EngineResult(
         datetime.now().astimezone().isoformat(timespec="seconds"),
         round(buy,1), round(sell,1), round(confidence,1), action, level,
-        round(resonance,1), missing_critical, warnings, factors, path
+        round(resonance,1), missing_critical, stale_critical, stale_keys, warnings, factors, path
     )
 
 def decision_tree_dot() -> str:
@@ -1058,6 +1259,7 @@ def factor_dataframe(factors: List[FactorResult]) -> pd.DataFrame:
         "weighted_contribution": None if x.contribution is None else round(x.contribution,3),
         "value": x.value,
         "missing": x.missing,
+        "stale": x.stale,
         "source": x.source,
         "detail": x.detail,
     } for x in factors])
@@ -1076,6 +1278,8 @@ def print_console(result: EngineResult) -> None:
 
     if result.missing_critical:
         print("关键缺失   :", ", ".join(result.missing_critical))
+    if result.stale_critical:
+        print("关键过期   :", ", ".join(result.stale_critical))
 
     print("\n决策路径：")
     for x in result.decision_path:
@@ -1083,7 +1287,7 @@ def print_console(result: EngineResult) -> None:
 
     print("\n因子明细：")
     show = factor_dataframe(result.factors)[
-        ["group","factor","weight","signal_-1bull_+1bear","value","missing","detail"]
+        ["group","factor","weight","signal_-1bull_+1bear","value","missing","stale","detail"]
     ]
     with pd.option_context("display.max_rows", 100, "display.max_colwidth", 80, "display.width", 180):
         print(show.to_string(index=False))

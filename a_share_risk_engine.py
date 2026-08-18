@@ -1133,16 +1133,19 @@ def compute_directional_bias(result: EngineResult) -> dict:
 
       SELL  = sell_score  (higher → more bearish)
       BUY   = buy_score   (higher → more bullish)
-      WATCH = abs(buy_score - sell_score) < 10 bonus allocation
+      WATCH = bonus allocation when buy and sell scores are close
 
     Normalised bias weights are derived as follows:
     1. raw_buy  = buy_score / 100
     2. raw_sell = sell_score / 100
-    3. watch_mass = max(0, 0.30 - abs(raw_buy - raw_sell)) * (1/0.30)
-       i.e. when the spread is very small (< 30 pp) some weight shifts
-       to WATCH, up to a maximum of ~30% of total.
-    4. Remaining weight is split proportionally between buy and sell.
-    5. All three are renormalised to sum to 1.
+    3. spread   = abs(raw_buy - raw_sell)            # in [0, 1]
+    4. watch_mass = max(0, 0.30 - spread)            # in [0, 0.30]
+       When the spread is very small (< 0.30 units), some weight shifts
+       to WATCH.  At spread=0 the watch_mass is 0.30 (maximum 30 pp).
+    5. remaining = 1.0 - watch_mass
+    6. w_buy  = remaining * raw_buy  / (raw_buy + raw_sell)
+       w_sell = remaining * raw_sell / (raw_buy + raw_sell)
+    7. All three are renormalised to sum to 100.
 
     This is a *directional bias score*, NOT a calibrated probability.
     ─────────────────────────────────────────────────────────────────────
@@ -1151,8 +1154,8 @@ def compute_directional_bias(result: EngineResult) -> dict:
     raw_sell = result.sell_score / 100.0
     spread   = abs(raw_buy - raw_sell)
 
-    # Watch mass: maximum 0.30, tapers to 0 at spread ≥ 0.30
-    watch_mass = max(0.0, 0.30 - spread)          # in [0, 0.30]
+    # watch_mass is in [0, 0.30]: maximum when spread=0, zero when spread≥0.30
+    watch_mass = max(0.0, 0.30 - spread)
     remaining  = 1.0 - watch_mass
     total_bs   = raw_buy + raw_sell if (raw_buy + raw_sell) > 0 else 1.0
     w_buy  = remaining * raw_buy  / total_bs
@@ -1238,7 +1241,8 @@ def print_console(result: EngineResult) -> None:
         print(f"    当前方向倾向 {bias_cn}，")
         print(f"    但因关键数据缺失（置信度 {result.confidence:.1f}% < 65%），")
         print(f"    动作不可执行，不建议据此直接交易。")
-        print(f"    补全 {', '.join(result.missing_critical)} 后可获取可执行信号。")
+        if result.missing_critical:
+            print(f"    补全 {', '.join(result.missing_critical)} 后可获取可执行信号。")
         print(SEP)
 
     # ── 6. Decision path ─────────────────────────────────────────────
@@ -1250,7 +1254,12 @@ def print_console(result: EngineResult) -> None:
     # ── 7. Top contributors (bullish / bearish) ───────────────────────
     available = [f for f in result.factors if not f.missing and f.contribution is not None]
     bullish = sorted(available, key=lambda x: x.contribution)[:3]   # most negative = most bullish
-    bearish = sorted(available, key=lambda x: -x.contribution)[:3]  # most positive = most bearish
+    bullish_names = {f.name for f in bullish}
+    # Exclude factors already shown as bullish to avoid duplicate entries
+    bearish = sorted(
+        [f for f in available if f.name not in bullish_names],
+        key=lambda x: -x.contribution
+    )[:3]  # most positive = most bearish
 
     if bullish:
         print("  ▲ 主要多头驱动 TOP BULLISH CONTRIBUTORS:")

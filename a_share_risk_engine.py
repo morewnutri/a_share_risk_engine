@@ -60,8 +60,12 @@ YF_TICKER_CANDIDATES = {
     "CHINEXT": ["399006.SZ"],
     "STAR50": ["000688.SS"],
     "HSI": ["^HSI"],
-    "HSTECH": ["^HSTECH", "3033.HK", "3067.HK"],
-    "A50": ["XIN9.SI", "2823.HK"],
+    # 3067.HK = 恒生科技ETF (Hang Seng TECH ETF); 3033.HK = ChinaAMC CSI Tech 100 ETF;
+    # ^HSTECH is not a valid yfinance symbol and is tried last as last resort
+    "HSTECH": ["3067.HK", "3033.HK", "^HSTECH"],
+    # 2823.HK = iShares FTSE A50 China Index ETF (reliable HK-listed proxy);
+    # XIN9.SI is often unavailable
+    "A50": ["2823.HK", "XIN9.SI"],
     "VIX": ["^VIX"],
     "NASDAQ100": ["^NDX"],
     "SOX": ["^SOX"],
@@ -416,8 +420,40 @@ class DataHub:
         except Exception as e:
             self.warnings.append(f"AKShare 中美国债收益率获取失败: {e}")
 
+    # AKShare index symbols for the alternative index_zh_a_hist API endpoint
+    _AK_INDEX_HIST_SYMBOLS: Dict[str, str] = {
+        "SSE": "000001",
+        "CSI300": "000300",
+        "CSI1000": "000852",
+        "CHINEXT": "399006",
+        "STAR50": "000688",
+    }
+
+    def _parse_ak_index_df(self, df: pd.DataFrame, key: str, source: str) -> bool:
+        """Parse a standard AKShare index DataFrame and store the series. Returns True if any data was stored."""
+        date_col = self._find_col(df, ["date", "日期"])
+        close_col = self._find_col(df, ["close", "收盘"])
+        amount_col = self._find_col(df, ["amount", "成交额"])
+        volume_col = self._find_col(df, ["volume", "成交量"])
+        if not date_col:
+            return False
+        idx = pd.to_datetime(df[date_col], errors="coerce")
+        added_any = False
+        if close_col and key not in self.series:
+            self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx), source)
+            added_any = True
+        if amount_col:
+            self.add(key + "_INDEX_AMOUNT",
+                     pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx), source)
+            added_any = True
+        if volume_col:
+            self.add(key + "_INDEX_VOLUME",
+                     pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx), source)
+            added_any = True
+        return added_any
+
     def fetch_a_index_history(self) -> None:
-        """用 AKShare 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。"""
+        """用 AKShare / baostock 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。"""
         if ak is None and bs is None:
             return
         bs_login_ok = False
@@ -430,39 +466,32 @@ class DataHub:
         for key, symbol in AK_INDEX_SYMBOLS.items():
             success = False
             try:
+                # --- Attempt 1: AKShare stock_zh_index_daily_em (EastMoney endpoint) ---
                 if ak is not None:
                     df = self._call_with_retry(
                         f"AKShare {key}({symbol})",
                         lambda sym=symbol: ak.stock_zh_index_daily_em(symbol=sym),
                     )
                     if df is not None and not df.empty:
-                        date_col = self._find_col(df, ["date", "日期"])
-                        close_col = self._find_col(df, ["close", "收盘"])
-                        amount_col = self._find_col(df, ["amount", "成交额"])
-                        volume_col = self._find_col(df, ["volume", "成交量"])
-                        if date_col:
-                            idx = pd.to_datetime(df[date_col], errors="coerce")
-                            added_any = False
-                            if close_col and key not in self.series:
-                                self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
-                                         f"AKShare:stock_zh_index_daily_em({symbol})")
-                                added_any = True
-                            if amount_col:
-                                self.add(key+"_INDEX_AMOUNT",
-                                         pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
-                                         f"AKShare:stock_zh_index_daily_em({symbol})")
-                                added_any = True
-                            if volume_col:
-                                self.add(key+"_INDEX_VOLUME",
-                                         pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
-                                         f"AKShare:stock_zh_index_daily_em({symbol})")
-                                added_any = True
-                            success = added_any
+                        if self._parse_ak_index_df(df, key, f"AKShare:stock_zh_index_daily_em({symbol})"):
+                            success = True
                         else:
                             self.warnings.append(f"A股指数历史缺日期列: {key}({symbol})")
-                if success:
-                    continue
-                if bs_login_ok and key in BAOSTOCK_INDEX_SYMBOLS:
+
+                # --- Attempt 2: AKShare index_zh_a_hist (alternative endpoint) ---
+                if not success and ak is not None and hasattr(ak, "index_zh_a_hist"):
+                    ak_sym = self._AK_INDEX_HIST_SYMBOLS.get(key)
+                    if ak_sym:
+                        df2 = self._call_with_retry(
+                            f"AKShare index_zh_a_hist({ak_sym})",
+                            lambda s=ak_sym: ak.index_zh_a_hist(symbol=s, period="daily"),
+                        )
+                        if df2 is not None and not df2.empty:
+                            if self._parse_ak_index_df(df2, key, f"AKShare:index_zh_a_hist({ak_sym})"):
+                                success = True
+
+                # --- Attempt 3: baostock ---
+                if not success and bs_login_ok and key in BAOSTOCK_INDEX_SYMBOLS:
                     code = BAOSTOCK_INDEX_SYMBOLS[key]
                     end_date = datetime.now().date()
                     start_date = end_date - timedelta(days=self.history_days * 2)
@@ -489,28 +518,76 @@ class DataHub:
                                 self.add(key, pd.Series(pd.to_numeric(dfb["close"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
                                 added_any = True
-                            if key+"_INDEX_AMOUNT" not in self.series:
-                                self.add(key+"_INDEX_AMOUNT",
+                            if key + "_INDEX_AMOUNT" not in self.series:
+                                self.add(key + "_INDEX_AMOUNT",
                                          pd.Series(pd.to_numeric(dfb["amount"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
                                 added_any = True
-                            if key+"_INDEX_VOLUME" not in self.series:
-                                self.add(key+"_INDEX_VOLUME",
+                            if key + "_INDEX_VOLUME" not in self.series:
+                                self.add(key + "_INDEX_VOLUME",
                                          pd.Series(pd.to_numeric(dfb["volume"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
                                 added_any = True
                             if added_any:
                                 success = True
                                 self.warnings.append(f"{key} 使用 baostock 回退数据源。")
+
             except Exception as e:
                 self.warnings.append(f"A股指数历史获取失败 {key}({symbol}): {e}")
+
             if not success:
                 self.warnings.append(f"A股指数历史仍缺失: {key}")
+
         if bs_login_ok:
             try:
                 bs.logout()
             except Exception:
                 pass
+
+    def fetch_ak_hk_indices(self) -> None:
+        """用 AKShare 获取恒生科技/A50等港股指数历史，作为 yfinance 的补充来源。"""
+        if ak is None:
+            return
+
+        # --- HSTECH: try stock_hk_index_daily_em with known index names ---
+        if "HSTECH" not in self.series:
+            for sym in ["恒生科技指数", "HSTECH"]:
+                if not hasattr(ak, "stock_hk_index_daily_em"):
+                    break
+                df = self._call_with_retry(
+                    f"AKShare stock_hk_index_daily_em({sym})",
+                    lambda s=sym: ak.stock_hk_index_daily_em(symbol=s),
+                )
+                if df is not None and not df.empty:
+                    date_col = self._find_col(df, ["date", "日期"])
+                    close_col = self._find_col(df, ["close", "收盘"])
+                    if date_col and close_col:
+                        idx = pd.to_datetime(df[date_col], errors="coerce")
+                        self.add(
+                            "HSTECH",
+                            pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
+                            f"AKShare:stock_hk_index_daily_em({sym})",
+                        )
+                        break
+
+        # --- A50: try index_zh_a_hist with SSE50 (000016) as a documented proxy ---
+        # The FTSE China A50 index is not directly in AKShare; SSE50 is the closest
+        # available domestic proxy and is labeled explicitly as such.
+        if "A50" not in self.series and hasattr(ak, "index_zh_a_hist"):
+            df = self._call_with_retry(
+                "AKShare index_zh_a_hist(000016/SSE50-A50proxy)",
+                lambda: ak.index_zh_a_hist(symbol="000016", period="daily"),
+            )
+            if df is not None and not df.empty:
+                date_col = self._find_col(df, ["日期", "date"])
+                close_col = self._find_col(df, ["收盘", "close"])
+                if date_col and close_col:
+                    idx = pd.to_datetime(df[date_col], errors="coerce")
+                    self.add(
+                        "A50",
+                        pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
+                        "AKShare:index_zh_a_hist(000016/SSE50) [A50 proxy — FTSE A50 not available via AKShare]",
+                    )
 
     def fetch_a_share_snapshot(self) -> None:
         if ak is None:
@@ -581,6 +658,10 @@ class DataHub:
                     self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
         except Exception as e:
             self.warnings.append(f"A股横截面获取失败: {e}")
+            # When live fetch fails, try to populate breadth fields from the most
+            # recent row stored in the local snapshot so downstream scoring has
+            # *something* to work with (explicitly labeled as stale).
+            self._inject_stale_snapshot_breadth()
 
     def fetch_margin(self) -> None:
         if ak is None:
@@ -671,6 +752,46 @@ class DataHub:
                     self.add(key, pd.Series(vals, index=idx), "manual")
             except Exception as e:
                 self.warnings.append(f"手工覆盖 {key} 读取失败: {e}")
+
+    def _inject_stale_snapshot_breadth(self) -> None:
+        """Load the most recent row from the local snapshot and inject it as stale breadth data."""
+        hist = self._load_snapshot_history()
+        if hist.empty:
+            return
+        try:
+            hist = hist.sort_values("date")
+            last = hist.iloc[-1]
+            last_date = pd.to_datetime(last["date"], errors="coerce")
+            if pd.isna(last_date):
+                return
+            src = f"local snapshot (stale, last={last['date']})"
+
+            def _inject(col: str, key: str) -> None:
+                val = pd.to_numeric(last.get(col, None), errors="coerce")
+                if not pd.isna(val):
+                    self.add(key, pd.Series([float(val)], index=[last_date]), src)
+
+            _inject("breadth", "A_BREADTH")
+            _inject("decliners", "A_DECLINERS")
+            _inject("strong3", "A_STRONG3")
+            _inject("weak3", "A_WEAK3")
+            _inject("limit_down_approx", "A_LIMIT_DOWN_APPROX")
+            _inject("limit_down_ratio", "A_LIMIT_DOWN_RATIO")
+            _inject("turnover", "A_TURNOVER")
+
+            # Also load historical breadth/turnover series for MA calculations
+            hist.index = pd.to_datetime(hist["date"])
+            if "breadth" in hist.columns:
+                self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history")
+            if "turnover" in hist.columns:
+                self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
+
+            self.warnings.append(
+                f"A股横截面获取失败，已使用本地快照 ({last['date']}) 作为临时回退；"
+                "数据已过期，仅供参考。"
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -1326,6 +1447,7 @@ def run(history_days: int = DEFAULT_HISTORY_DAYS, no_live: bool = False) -> Engi
     hub = DataHub(history_days)
     if not no_live:
         hub.fetch_yfinance()
+        hub.fetch_ak_hk_indices()
         hub.fetch_fred()
         hub.fetch_ak_bond_yields()
         hub.fetch_a_index_history()

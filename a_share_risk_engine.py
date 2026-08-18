@@ -512,20 +512,18 @@ class DataHub:
                             rows.append(rs.get_row_data())
                         if rows:
                             dfb = pd.DataFrame(rows, columns=["date", "close", "volume", "amount"])
+                            idx = pd.to_datetime(dfb["date"], errors="coerce")
                             added_any = False
                             if key not in self.series:
-                                idx = pd.to_datetime(dfb["date"], errors="coerce")
                                 self.add(key, pd.Series(pd.to_numeric(dfb["close"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
                                 added_any = True
                             if key + "_INDEX_AMOUNT" not in self.series:
-                                idx = pd.to_datetime(dfb["date"], errors="coerce")
                                 self.add(key + "_INDEX_AMOUNT",
                                          pd.Series(pd.to_numeric(dfb["amount"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
                                 added_any = True
                             if key + "_INDEX_VOLUME" not in self.series:
-                                idx = pd.to_datetime(dfb["date"], errors="coerce")
                                 self.add(key + "_INDEX_VOLUME",
                                          pd.Series(pd.to_numeric(dfb["volume"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
@@ -770,7 +768,7 @@ class DataHub:
 
             def _inject(col: str, key: str) -> None:
                 val = pd.to_numeric(last.get(col, None), errors="coerce")
-                if not math.isnan(float(val if val is not None else float("nan"))):
+                if not pd.isna(val):
                     self.add(key, pd.Series([float(val)], index=[last_date]), src)
 
             _inject("breadth", "A_BREADTH")

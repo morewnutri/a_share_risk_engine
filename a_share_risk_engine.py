@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Set
 
 import numpy as np
 import pandas as pd
@@ -293,7 +293,7 @@ class DataHub:
             return MAX_AGE_DAYS["ak_macro"]
         return MAX_AGE_DAYS["market"]
 
-    def stale_keys(self) -> set:
+    def get_stale_keys(self) -> Set[str]:
         out = set()
         now = pd.Timestamp.now().normalize()
         for key, ds in self.series.items():
@@ -479,12 +479,14 @@ class DataHub:
                             if key not in self.series:
                                 self.add(key, pd.Series(pd.to_numeric(dfb["close"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
-                            self.add(key+"_INDEX_AMOUNT",
-                                     pd.Series(pd.to_numeric(dfb["amount"], errors="coerce").values, index=idx),
-                                     f"baostock:query_history_k_data_plus({code})")
-                            self.add(key+"_INDEX_VOLUME",
-                                     pd.Series(pd.to_numeric(dfb["volume"], errors="coerce").values, index=idx),
-                                     f"baostock:query_history_k_data_plus({code})")
+                            if key+"_INDEX_AMOUNT" not in self.series:
+                                self.add(key+"_INDEX_AMOUNT",
+                                         pd.Series(pd.to_numeric(dfb["amount"], errors="coerce").values, index=idx),
+                                         f"baostock:query_history_k_data_plus({code})")
+                            if key+"_INDEX_VOLUME" not in self.series:
+                                self.add(key+"_INDEX_VOLUME",
+                                         pd.Series(pd.to_numeric(dfb["volume"], errors="coerce").values, index=idx),
+                                         f"baostock:query_history_k_data_plus({code})")
                             if key in self.series:
                                 success = True
                                 self.warnings.append(f"{key} 使用 baostock 回退数据源。")
@@ -1037,7 +1039,7 @@ class FactorEngine:
             sig = None if x is None else piecewise_risk(x, [(-3,1),(-1.5,0.6),(-0.5,0.2),(0,0),(0.5,-0.1),(1.5,-0.2)])
             R.append(make_factor(name,"A股衍生品",w,sig,x,f"{key}={x}%；负值贴水偏风险",h.source(key)))
 
-        stale_keys = h.stale_keys()
+        stale_keys = h.get_stale_keys()
         factor_source_keys = {
             "美债10Y绝对水平": ["US10Y"],
             "美债10Y斜率/变化速度": ["US10Y"],
@@ -1161,8 +1163,9 @@ def score_engine(factors: List[FactorResult],
 
     weight_coverage = valid_weight / total_weight if total_weight else 0
     missing_critical = [k for k in sorted(CRITICAL_KEYS) if features.get(k) is None]
-    stale_keys = sorted(hub.stale_keys())
-    stale_critical = [k for k in sorted(CRITICAL_KEYS) if k in stale_keys and features.get(k) is not None]
+    stale_keys_set = hub.get_stale_keys()
+    stale_critical = [k for k in sorted(CRITICAL_KEYS) if k in stale_keys_set and features.get(k) is not None]
+    stale_keys = sorted(stale_keys_set)
     critical_coverage = 1.0 - (len(missing_critical) + 0.5 * len(stale_critical)) / len(CRITICAL_KEYS)
     critical_coverage = float(np.clip(critical_coverage, 0, 1))
     confidence = float(np.clip(100.0*(0.65*weight_coverage + 0.35*critical_coverage), 0, 100))

@@ -1004,43 +1004,101 @@ def score_engine(factors: List[FactorResult],
     )
 
 def decision_tree_dot() -> str:
+    # Font fallback: use a cross-platform safe font stack so that Chinese
+    # characters render on systems without Microsoft YaHei.  Graphviz will
+    # try each font in the fontname value; if none is available the labels
+    # may appear as boxes, but the ASCII text version (decision_tree_text.txt)
+    # will always be readable regardless of font support.
     return r"""digraph AShareRiskTree {
     rankdir=TB;
-    graph [fontname="Microsoft YaHei"];
-    node [shape=box, style="rounded", fontname="Microsoft YaHei"];
-    edge [fontname="Microsoft YaHei"];
+    graph [fontname="Arial Unicode MS,WenQuanYi Micro Hei,DejaVu Sans,sans-serif"];
+    node [shape=box, style="rounded", fontname="Arial Unicode MS,WenQuanYi Micro Hei,DejaVu Sans,sans-serif"];
+    edge [fontname="Arial Unicode MS,WenQuanYi Micro Hei,DejaVu Sans,sans-serif"];
 
-    A [label="数据置信度 >= 65% 且关键缺失 < 3?"];
-    B [label="DATA_INCOMPLETE\n不根据信号交易"];
-    C [label="VIX >= 30 且\nCNH 5日贬值 >= 1% ?"];
-    D [label="RISK_OFF\n显著降低仓位"];
-    E [label="实际利率 >= 2%\n且10Y 20日 +40bp\n且CNH 5日贬值 >=1% ?"];
-    F [label="REDUCE\n偏卖出"];
-    G [label="卖出分 >= 68 ?"];
-    H [label="买入分 >=65\n且上涨家数 >=60% ?"];
-    I [label="BUY_BIAS\n分批偏买入"];
-    J [label="买入分 >=60 ?"];
-    K [label="WATCH_BUY\n观察偏多"];
-    L [label="HOLD\n中性等待"];
+    A [label="Confidence>=65% & missing_critical<3?\n(数据置信度>=65% 且关键缺失<3)"];
+    B [label="DATA_INCOMPLETE\n(no trade / 不根据信号交易)"];
+    C [label="VIX>=30 AND CNH 5d depreciation>=1%?\n(VIX>=30 且 CNH 5日贬值>=1%)"];
+    D [label="RISK_OFF\n(reduce position / 显著降低仓位)"];
+    E [label="Real yield>=2% AND 10Y +40bp/20d AND CNH 5d>=1%?\n(实际利率>=2% 且10Y 20日+40bp 且CNH走弱)"];
+    F [label="REDUCE\n(lean sell / 偏卖出)"];
+    G [label="sell_score >= 68?\n(卖出分>=68)"];
+    H [label="buy_score>=65 AND breadth>=60%?\n(买入分>=65 且上涨家数>=60%)"];
+    I [label="BUY_BIAS\n(scale in / 分批偏买入)"];
+    J [label="buy_score >= 60?\n(买入分>=60)"];
+    K [label="WATCH_BUY\n(observe lean long / 观察偏多)"];
+    L [label="HOLD\n(neutral wait / 中性等待)"];
 
-    A -> B [label="否"];
-    A -> C [label="是"];
-    C -> D [label="是"];
-    C -> E [label="否"];
-    E -> F [label="是"];
-    E -> G [label="否"];
-    G -> F [label="是"];
-    G -> H [label="否"];
-    H -> I [label="是"];
-    H -> J [label="否"];
-    J -> K [label="是"];
-    J -> L [label="否"];
+    A -> B [label="No/否"];
+    A -> C [label="Yes/是"];
+    C -> D [label="Yes/是"];
+    C -> E [label="No/否"];
+    E -> F [label="Yes/是"];
+    E -> G [label="No/否"];
+    G -> F [label="Yes/是"];
+    G -> H [label="No/否"];
+    H -> I [label="Yes/是"];
+    H -> J [label="No/否"];
+    J -> K [label="Yes/是"];
+    J -> L [label="No/否"];
 }"""
+
+def decision_tree_text() -> str:
+    """
+    Plain-text / ASCII representation of the decision tree.
+    Always readable regardless of font or graphviz availability.
+    """
+    return """\
+A-Share Risk Engine – Decision Tree (ASCII / text version)
+============================================================
+
+[ROOT] Confidence >= 65% AND missing_critical < 3?
+  |
+  +--[No/否]--> DATA_INCOMPLETE  (不根据信号交易)
+  |             Action: do not trade based on signals.
+  |             → Check directional bias in terminal summary for tendency.
+  |
+  +--[Yes/是]-> VIX >= 30 AND CNH 5-day depreciation >= 1%?
+                |
+                +--[Yes/是]--> RISK_OFF  (显著降低仓位)
+                |              Action: significantly reduce positions.
+                |
+                +--[No/否]--> Real yield >= 2%
+                              AND 10Y up +40 bp/20d
+                              AND CNH 5d depreciation >= 1%?
+                              |
+                              +--[Yes/是]--> REDUCE  (偏卖出)
+                              |              Action: lean sell.
+                              |
+                              +--[No/否]--> sell_score >= 68?
+                                            |
+                                            +--[Yes/是]--> REDUCE  (偏卖出)
+                                            |
+                                            +--[No/否]--> buy_score >= 65
+                                                          AND breadth >= 60%?
+                                                          |
+                                                          +--[Yes/是]--> BUY_BIAS  (分批偏买入)
+                                                          |              Action: scale in.
+                                                          |
+                                                          +--[No/否]--> buy_score >= 60?
+                                                                        |
+                                                                        +--[Yes/是]--> WATCH_BUY  (观察偏多)
+                                                                        |
+                                                                        +--[No/否]--> HOLD  (中性等待)
+
+Notes:
+  - Signal convention: signal > 0 → bearish contribution; signal < 0 → bullish.
+  - buy_score + sell_score = 100.
+  - Resonance adjustments (共振) can shift sell_score by ±6–8 pts per rule.
+  - See output/factor_report.csv for per-factor details.
+"""
 
 def save_decision_tree() -> Tuple[Path, Optional[Path]]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     dot_path = OUTPUT_DIR / "decision_tree.dot"
     dot_path.write_text(decision_tree_dot(), encoding="utf-8")
+    # Always write a portable plain-text version (readable even if PNG fonts are garbled)
+    text_path = OUTPUT_DIR / "decision_tree_text.txt"
+    text_path.write_text(decision_tree_text(), encoding="utf-8")
     try:
         import graphviz
         src = graphviz.Source(decision_tree_dot())
@@ -1062,41 +1120,188 @@ def factor_dataframe(factors: List[FactorResult]) -> pd.DataFrame:
         "detail": x.detail,
     } for x in factors])
 
+def compute_directional_bias(result: EngineResult) -> dict:
+    """
+    Compute a human-readable directional bias breakdown even when the
+    executable action is DATA_INCOMPLETE.
+
+    Mapping logic (documented):
+    ─────────────────────────────────────────────────────────────────────
+    The engine already produces buy_score (0-100) and sell_score (0-100)
+    where buy_score + sell_score == 100.  We further split the "middle"
+    band into a WATCH bucket so users get three categories:
+
+      SELL  = sell_score  (higher → more bearish)
+      BUY   = buy_score   (higher → more bullish)
+      WATCH = bonus allocation when buy and sell scores are close
+
+    Normalised bias weights are derived as follows:
+    1. raw_buy  = buy_score / 100
+    2. raw_sell = sell_score / 100
+    3. spread   = abs(raw_buy - raw_sell)            # in [0, 1]
+    4. watch_mass = max(0, 0.30 - spread)            # in [0, 0.30]
+       When the spread is very small (< 0.30 units), some weight shifts
+       to WATCH.  At spread=0 the watch_mass is 0.30 (maximum 30 pp).
+    5. remaining = 1.0 - watch_mass
+    6. w_buy  = remaining * raw_buy  / (raw_buy + raw_sell)
+       w_sell = remaining * raw_sell / (raw_buy + raw_sell)
+    7. All three are renormalised to sum to 100.
+
+    This is a *directional bias score*, NOT a calibrated probability.
+    ─────────────────────────────────────────────────────────────────────
+    """
+    raw_buy  = result.buy_score  / 100.0
+    raw_sell = result.sell_score / 100.0
+    spread   = abs(raw_buy - raw_sell)
+
+    # watch_mass is in [0, 0.30]: maximum when spread=0, zero when spread≥0.30
+    watch_mass = max(0.0, 0.30 - spread)
+    remaining  = 1.0 - watch_mass
+    total_bs   = raw_buy + raw_sell if (raw_buy + raw_sell) > 0 else 1.0
+    w_buy  = remaining * raw_buy  / total_bs
+    w_sell = remaining * raw_sell / total_bs
+
+    total  = w_buy + w_sell + watch_mass
+    return {
+        "BUY":   round(w_buy   / total * 100, 1),
+        "WATCH": round(watch_mass / total * 100, 1),
+        "SELL":  round(w_sell  / total * 100, 1),
+    }
+
+
+def bias_label(bias: dict) -> str:
+    """Return a short English bias label from the bias dict."""
+    if bias["BUY"] >= 50:
+        return "BULLISH"
+    if bias["SELL"] >= 50:
+        return "BEARISH"
+    return "NEUTRAL/WATCH"
+
+
 def print_console(result: EngineResult) -> None:
-    print("\n" + "="*76)
-    print("A股多因子外部风险评分")
-    print("="*76)
-    print(f"时间       : {result.timestamp}")
-    print(f"买入分     : {result.buy_score:5.1f} / 100")
-    print(f"卖出分     : {result.sell_score:5.1f} / 100")
-    print(f"风险等级   : {result.risk_level}")
-    print(f"数据置信度 : {result.confidence:5.1f}%")
-    print(f"共振调整   : {result.resonance_adjustment:+.1f}")
-    print(f"最终动作   : {result.action}")
+    """
+    Print a concise, human-readable summary to stdout.
 
+    Verbose factor tables are suppressed here; they are saved to
+    output/factor_report.csv and output/latest_score.json instead.
+    """
+    W = 72
+    SEP = "─" * W
+
+    bias   = compute_directional_bias(result)
+    b_lbl  = bias_label(bias)
+    is_incomplete = "DATA_INCOMPLETE" in result.action
+
+    print("\n" + "=" * W)
+    print("  A股多因子外部风险评分引擎  /  A-Share Risk Engine")
+    print("=" * W)
+    print(f"  时间 / Time      : {result.timestamp}")
+    print(SEP)
+
+    # ── 1. Executable action ──────────────────────────────────────────
+    print(f"  最终动作  ACTION : {result.action}")
+    print(f"  风险等级  LEVEL  : {result.risk_level}")
+    print(SEP)
+
+    # ── 2. Data quality ───────────────────────────────────────────────
+    print(f"  数据置信度 CONF  : {result.confidence:5.1f}%  "
+          f"({'⚠ 偏低，建议补全关键数据' if result.confidence < 65 else '✓ 可执行'})")
     if result.missing_critical:
-        print("关键缺失   :", ", ".join(result.missing_critical))
+        print(f"  关键缺失  MISSING: {', '.join(result.missing_critical)}")
+    print(SEP)
 
-    print("\n决策路径：")
-    for x in result.decision_path:
-        print("  -", x)
+    # ── 3. Buy/sell scores ────────────────────────────────────────────
+    print(f"  买入分  BUY SCORE: {result.buy_score:5.1f} / 100")
+    print(f"  卖出分 SELL SCORE: {result.sell_score:5.1f} / 100")
+    print(f"  共振调整 RESONANC: {result.resonance_adjustment:+.1f} pt")
+    print(SEP)
 
-    print("\n因子明细：")
-    show = factor_dataframe(result.factors)[
-        ["group","factor","weight","signal_-1bull_+1bear","value","missing","detail"]
-    ]
-    with pd.option_context("display.max_rows", 100, "display.max_colwidth", 80, "display.width", 180):
-        print(show.to_string(index=False))
+    # ── 4. Directional bias (always shown, even under DATA_INCOMPLETE) ─
+    # NOTE: This is a directional bias score derived from factor weights;
+    #       it is NOT a statistically calibrated probability.
+    print("  方向倾向 BIAS SCORES (非统计概率 / not calibrated probabilities):")
+    bar_w = 30
+    for lbl, key in [("做多 BUY ", "BUY"), ("观望 WATCH", "WATCH"), ("做空 SELL", "SELL")]:
+        pct   = bias[key]
+        filled = int(round(pct / 100 * bar_w))
+        bar    = "█" * filled + "░" * (bar_w - filled)
+        print(f"    {lbl}: {bar} {pct:5.1f}%")
+    print(f"  → 倾向方向: {b_lbl}")
+    print(SEP)
 
-    if result.warnings:
-        print("\n⚠ 数据提醒：")
-        for w in result.warnings:
-            print("  -", w)
+    # ── 5. DATA_INCOMPLETE plain-English explanation ──────────────────
+    if is_incomplete:
+        if b_lbl == "BEARISH":
+            bias_cn = "偏空 (mildly / moderately bearish)"
+        elif b_lbl == "BULLISH":
+            bias_cn = "偏多 (mildly / moderately bullish)"
+        else:
+            bias_cn = "中性/观望 (neutral / watch)"
+        print(f"  ⓘ DATA_INCOMPLETE 说明:")
+        print(f"    当前方向倾向 {bias_cn}，")
+        print(f"    但因关键数据缺失（置信度 {result.confidence:.1f}% < 65%），")
+        print(f"    动作不可执行，不建议据此直接交易。")
+        if result.missing_critical:
+            print(f"    补全 {', '.join(result.missing_critical)} 后可获取可执行信号。")
+        print(SEP)
+
+    # ── 6. Decision path ─────────────────────────────────────────────
+    print("  决策路径 DECISION PATH:")
+    for step in result.decision_path:
+        print(f"    → {step}")
+    print(SEP)
+
+    # ── 7. Top contributors (bullish / bearish) ───────────────────────
+    available = [f for f in result.factors if not f.missing and f.contribution is not None]
+    bullish = sorted(available, key=lambda x: x.contribution)[:3]   # most negative = most bullish
+    bullish_names = {f.name for f in bullish}
+    # Exclude factors already shown as bullish to avoid duplicate entries
+    bearish = sorted(
+        [f for f in available if f.name not in bullish_names],
+        key=lambda x: -x.contribution
+    )[:3]  # most positive = most bearish
+
+    if bullish:
+        print("  ▲ 主要多头驱动 TOP BULLISH CONTRIBUTORS:")
+        for f in bullish:
+            print(f"    + {f.name:<22s} wt={f.weight:4.1f}  contrib={f.contribution:+.2f}")
+    if bearish:
+        print("  ▼ 主要空头驱动 TOP BEARISH CONTRIBUTORS:")
+        for f in bearish:
+            print(f"    - {f.name:<22s} wt={f.weight:4.1f}  contrib={f.contribution:+.2f}")
+    print(SEP)
+
+    # ── 8. Important warnings (deduplicated, capped at 5) ────────────
+    # Filter to show only meaningful / actionable warnings in terminal.
+    important_warnings = [
+        w for w in result.warnings
+        if any(kw in w for kw in ["关键数据缺失", "FRED_API_KEY", "过期", "yfinance 无数据"])
+    ][:5]
+    if important_warnings:
+        print("  ⚠ 重要提醒 IMPORTANT WARNINGS:")
+        for w in important_warnings:
+            print(f"    ! {w}")
+        if len(result.warnings) > len(important_warnings):
+            print(f"    … 详见 output/latest_score.json (warnings 字段，共 {len(result.warnings)} 条)")
+        print(SEP)
+
+    print("  详细因子报告 → output/factor_report.csv")
+    print("  完整快照     → output/latest_score.json")
+    print("  决策树图     → output/decision_tree.png  (文字版见 output/decision_tree_text.txt)")
+    print("=" * W + "\n")
 
 def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     obj = asdict(result)
     obj["factors"] = [asdict(x) for x in result.factors]
+    # Embed directional bias into the JSON for downstream consumers
+    bias = compute_directional_bias(result)
+    obj["directional_bias"] = bias
+    obj["directional_bias_label"] = bias_label(bias)
+    obj["note_bias"] = (
+        "directional_bias is a normalized decision-weight score (NOT a calibrated probability). "
+        "BUY+WATCH+SELL = 100. Useful for understanding tendency even when action=DATA_INCOMPLETE."
+    )
     (OUTPUT_DIR / "latest_score.json").write_text(
         json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8"
     )

@@ -440,18 +440,22 @@ class DataHub:
                         volume_col = self._find_col(df, ["volume", "成交量"])
                         if date_col:
                             idx = pd.to_datetime(df[date_col], errors="coerce")
+                            added_any = False
                             if close_col and key not in self.series:
                                 self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
                                          f"AKShare:stock_zh_index_daily_em({symbol})")
+                                added_any = True
                             if amount_col:
                                 self.add(key+"_INDEX_AMOUNT",
                                          pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
                                          f"AKShare:stock_zh_index_daily_em({symbol})")
+                                added_any = True
                             if volume_col:
                                 self.add(key+"_INDEX_VOLUME",
                                          pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
                                          f"AKShare:stock_zh_index_daily_em({symbol})")
-                            success = key in self.series
+                                added_any = True
+                            success = added_any
                 if success:
                     continue
                 if bs_login_ok and key in BAOSTOCK_INDEX_SYMBOLS:
@@ -460,11 +464,11 @@ class DataHub:
                     start_date = end_date - timedelta(days=self.history_days * 2)
                     rs = self._call_with_retry(
                         f"baostock {key}({code})",
-                        lambda c=code: bs.query_history_k_data_plus(
+                        lambda c=code, sd=start_date, ed=end_date: bs.query_history_k_data_plus(
                             c,
                             "date,close,volume,amount",
-                            start_date=start_date.isoformat(),
-                            end_date=end_date.isoformat(),
+                            start_date=sd.isoformat(),
+                            end_date=ed.isoformat(),
                             frequency="d",
                             adjustflag="3",
                         ),
@@ -476,18 +480,22 @@ class DataHub:
                         if rows:
                             dfb = pd.DataFrame(rows, columns=["date", "close", "volume", "amount"])
                             idx = pd.to_datetime(dfb["date"], errors="coerce")
+                            added_any = False
                             if key not in self.series:
                                 self.add(key, pd.Series(pd.to_numeric(dfb["close"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
+                                added_any = True
                             if key+"_INDEX_AMOUNT" not in self.series:
                                 self.add(key+"_INDEX_AMOUNT",
                                          pd.Series(pd.to_numeric(dfb["amount"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
+                                added_any = True
                             if key+"_INDEX_VOLUME" not in self.series:
                                 self.add(key+"_INDEX_VOLUME",
                                          pd.Series(pd.to_numeric(dfb["volume"], errors="coerce").values, index=idx),
                                          f"baostock:query_history_k_data_plus({code})")
-                            if key in self.series:
+                                added_any = True
+                            if added_any:
                                 success = True
                                 self.warnings.append(f"{key} 使用 baostock 回退数据源。")
             except Exception as e:

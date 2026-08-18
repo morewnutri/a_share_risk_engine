@@ -1,0 +1,22 @@
+digraph AShareRiskTree {
+    rankdir=TB;
+    node [shape=box, style="rounded"];
+    A [label="数据置信度 >= 65% 且关键缺失 < 3?"];
+    B [label="DATA_INCOMPLETE"];
+    C [label="VIX >= 30 且 CNH 5日贬值 >= 1% ?"];
+    D [label="RISK_OFF / 降低仓位"];
+    E [label="实际利率 >= 2% 且 10Y 20日+40bp 且 CNH走弱 ?"];
+    F [label="REDUCE / 偏卖出"];
+    G [label="卖出分 >= 68 ?"];
+    H [label="买入分 >=65 且 上涨家数 >=60% ?"];
+    I [label="BUY_BIAS / 分批偏买入"];
+    J [label="买入分 >=60 ?"];
+    K [label="WATCH_BUY"];
+    L [label="HOLD"];
+    A -> B [label="否"]; A -> C [label="是"];
+    C -> D [label="是"]; C -> E [label="否"];
+    E -> F [label="是"]; E -> G [label="否"];
+    G -> F [label="是"]; G -> H [label="否"];
+    H -> I [label="是"]; H -> J [label="否"];
+    J -> K [label="是"]; J -> L [label="否"];
+}

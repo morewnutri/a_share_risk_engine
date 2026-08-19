@@ -1093,6 +1093,46 @@ def print_console(result: EngineResult) -> None:
         for w in result.warnings:
             print("  -", w)
 
+RUN_HISTORY_CSV = OUTPUT_DIR / "run_history.csv"
+
+# Feature keys persisted on every run for the dashboard trend charts
+HISTORY_FEATURE_KEYS = [
+    "VIX", "US10Y", "US10Y_REAL", "US2Y", "HY_OAS",
+    "USDCNH", "DXY_5D", "USDCNH_5D",
+    "CSI300_5D", "CSI300_20D", "HSTECH_5D",
+    "A_BREADTH", "A_TURNOVER_MA20_RATIO",
+    "COPPER_20D", "OIL_20D",
+]
+
+def append_run_history(result: EngineResult, features: Dict[str, Optional[float]]) -> None:
+    """Append a one-row summary of this run to output/run_history.csv for the dashboard."""
+    row: Dict[str, Any] = {
+        "timestamp": result.timestamp,
+        "buy_score": result.buy_score,
+        "sell_score": result.sell_score,
+        "confidence": result.confidence,
+        "action": result.action,
+        "risk_level": result.risk_level,
+        "resonance_adjustment": result.resonance_adjustment,
+        "missing_critical_count": len(result.missing_critical),
+    }
+    for k in HISTORY_FEATURE_KEYS:
+        row[k] = features.get(k)
+    df_new = pd.DataFrame([row])
+    if RUN_HISTORY_CSV.exists():
+        df_old = pd.read_csv(RUN_HISTORY_CSV, encoding="utf-8-sig")
+        # Deduplicate: keep only the latest entry per calendar date
+        df_old["_date"] = pd.to_datetime(df_old["timestamp"], utc=True, errors="coerce").dt.date
+        today = pd.to_datetime(result.timestamp, utc=True, errors="coerce").date()
+        df_old = df_old[df_old["_date"] != today].drop(columns=["_date"])
+        df_combined = pd.concat([df_old, df_new], ignore_index=True)
+    else:
+        df_combined = df_new
+    # Keep only latest 90 rows to avoid unbounded growth
+    df_combined = df_combined.tail(90)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    df_combined.to_csv(RUN_HISTORY_CSV, index=False, encoding="utf-8-sig")
+
 def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     obj = asdict(result)
@@ -1106,6 +1146,7 @@ def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> 
     pd.DataFrame([features]).to_csv(
         OUTPUT_DIR / "feature_snapshot.csv", index=False, encoding="utf-8-sig"
     )
+    append_run_history(result, features)
     save_decision_tree()
 
 def calibration_notes() -> str:

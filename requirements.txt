@@ -4,3 +4,4 @@ requests>=2.31
 yfinance>=0.2
 akshare
 graphviz>=0.21
+streamlit>=1.30

@@ -1,0 +1,40 @@
+﻿group,factor,weight,signal_-1bull_+1bear,weighted_contribution,value,missing,source,detail
+全球利率,美债10Y绝对水平,5.0,,,,True,MISSING,缺失
+全球利率,美债10Y斜率/变化速度,8.0,,,,True,MISSING,"5日=Nonebp, 20日=Nonebp；快速上行权重高于绝对值"
+全球利率,美债10Y实际利率,8.5,,,,True,MISSING,缺失
+全球利率,美债2Y/Fed预期重定价,5.0,,,,True,MISSING,"2Y: 5日=Nonebp, 20日=Nonebp"
+央行政策,美联储政策利率方向,2.0,,,,True,MISSING,"Fed Funds=None%, 20日变化=Nonebp；低权重"
+央行政策,日本央行政策利率方向,2.0,,,,True,MISSING,"BOJ=None%, 20日变化=Nonebp"
+全球信用,美国高收益债OAS,4.0,,,,True,MISSING,"HY OAS=None%, 5日变化=Nonebp"
+汇率,离岸人民币USD/CNH,8.5,,,,True,MISSING,"现值=None, 5日=None%, 20日=None%；上涨=人民币走弱"
+汇率,美元指数DXY,4.5,,,,True,MISSING,"DXY=None, 5日=None%, 20日=None%"
+汇率,中美10Y国债利差,3.0,,,,True,MISSING + MISSING,"CN-US=Nonebp, 20日变化=Nonebp"
+全球风险,VIX恐慌指数,7.5,,,,True,MISSING,"VIX=None, 5日=None%"
+中国资产外盘,恒生科技,6.0,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+中国资产外盘,恒生指数,3.0,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+中国资产外盘,富时中国A50,4.0,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+全球科技,纳斯达克100,3.5,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+全球科技,费城半导体SOX,4.5,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+亚洲风险,日经225,2.0,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+亚洲/半导体周期,韩国KOSPI,1.5,,,,True,MISSING,"1日=None%, 5日=None%, 20日=None%；看变化速度"
+亚洲流动性,日元套息平仓风险,3.0,,,,True,MISSING,"USDJPY 1日=None%, 5日=None%；负值越大=日元升值越快"
+商品/增长,铜价趋势,1.5,,,,True,MISSING,铜20日=None%；大跌偏风险，大涨只给有限利多
+商品/通胀,原油趋势,1.5,,,,True,MISSING,原油20日=None%；暴涨=通胀风险，暴跌=需求/信用风险
+商品/中国需求,铁矿石趋势,1.0,,,,True,MISSING,铁矿20日=None%；仅作为中国周期温度计
+A股内部,沪深300自身趋势,5.0,,,,True,MISSING,"5日=None%, 20日=None%；确认外部冲击是否传入"
+A股内部,创业板趋势,2.0,,,,True,MISSING,"5日=None%, 20日=None%"
+A股内部,科创50趋势,2.0,,,,True,MISSING,"5日=None%, 20日=None%"
+A股内部,中证1000趋势,2.0,,,,True,MISSING,"5日=None%, 20日=None%"
+A股内部,A股上涨家数比例,5.5,,,,True,MISSING,上涨比例=None%；<30%偏空，>60%偏多
+A股内部,A股强弱扩散差,2.5,,,,True,MISSING,跌幅>=3%占比 - 涨幅>=3%占比 = None；正值越大说明弱股扩散
+A股内部,A股近似跌停比例,2.0,,,,True,MISSING,近似跌停股占全部A股=None%；使用比例而非固定家数
+A股成交结构,沪深300成交额确认,1.5,,,,True,MISSING,"成交额/MA20=None, 指数5日=None%；放量只用于确认方向"
+A股成交结构,中证1000成交额确认,1.2,,,,True,MISSING,"成交额/MA20=None, 指数5日=None%；放量只用于确认方向"
+A股成交结构,创业板成交额确认,1.2,,,,True,MISSING,"成交额/MA20=None, 指数5日=None%；放量只用于确认方向"
+A股成交结构,科创50成交额确认,1.2,,,,True,MISSING,"成交额/MA20=None, 指数5日=None%；放量只用于确认方向"
+A股内部,A股成交额/MA20,2.0,,,,True,MISSING,成交额比=None；量本身无方向，主要用于共振规则
+A股内部,融资余额变化,2.5,,,,True,MISSING,"5日=None%, 20日=None%；持续下降偏风险"
+A股资金,主要宽基ETF 5日净流入,2.0,,,,True,MISSING,5日净流入=None亿元；正值偏多
+A股衍生品,IF基差,1.0,,,,True,MISSING,IF_BASIS_PCT=None%；负值贴水偏风险
+A股衍生品,IC基差,0.8,,,,True,MISSING,IC_BASIS_PCT=None%；负值贴水偏风险
+A股衍生品,IM基差,0.8,,,,True,MISSING,IM_BASIS_PCT=None%；负值贴水偏风险

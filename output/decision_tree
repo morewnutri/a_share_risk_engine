@@ -1,0 +1,32 @@
+digraph AShareRiskTree {
+    rankdir=TB;
+    graph [fontname="Microsoft YaHei"];
+    node [shape=box, style="rounded", fontname="Microsoft YaHei"];
+    edge [fontname="Microsoft YaHei"];
+
+    A [label="数据置信度 >= 65% 且关键缺失 < 3?"];
+    B [label="DATA_INCOMPLETE\n不根据信号交易"];
+    C [label="VIX >= 30 且\nCNH 5日贬值 >= 1% ?"];
+    D [label="RISK_OFF\n显著降低仓位"];
+    E [label="实际利率 >= 2%\n且10Y 20日 +40bp\n且CNH 5日贬值 >=1% ?"];
+    F [label="REDUCE\n偏卖出"];
+    G [label="卖出分 >= 68 ?"];
+    H [label="买入分 >=65\n且上涨家数 >=60% ?"];
+    I [label="BUY_BIAS\n分批偏买入"];
+    J [label="买入分 >=60 ?"];
+    K [label="WATCH_BUY\n观察偏多"];
+    L [label="HOLD\n中性等待"];
+
+    A -> B [label="否"];
+    A -> C [label="是"];
+    C -> D [label="是"];
+    C -> E [label="否"];
+    E -> F [label="是"];
+    E -> G [label="否"];
+    G -> F [label="是"];
+    G -> H [label="否"];
+    H -> I [label="是"];
+    H -> J [label="否"];
+    J -> K [label="是"];
+    J -> L [label="否"];
+}

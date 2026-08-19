@@ -20,6 +20,7 @@ A股多因子外部风险评分引擎
 from __future__ import annotations
 
 import argparse
+import html as _html
 import json
 import math
 import os
@@ -402,9 +403,9 @@ class DataHub:
             self._load_stale_breadth_fallback()
             return
         fetched = False
+        # Try primary endpoint; add genuinely different endpoints here if AKShare adds them.
         for attempt_fn, label in [
             (lambda: ak.stock_zh_a_spot_em(), "stock_zh_a_spot_em"),
-            (lambda: ak.stock_zh_a_spot_em() if hasattr(ak, "stock_zh_a_spot_em") else None, "stock_zh_a_spot_em-retry"),
         ]:
             try:
                 df = attempt_fn()
@@ -1189,14 +1190,17 @@ def _save_html_report(result: EngineResult, features: Dict[str, Optional[float]]
         sig_str = f"{x.signal:+.2f}" if x.signal is not None else "—"
         val_str = f"{x.value:.4g}" if x.value is not None else "—"
         miss = "⚠ 缺失" if x.missing else ""
+        detail_esc = _html.escape(x.detail[:80])
+        group_esc = _html.escape(x.group)
+        name_esc = _html.escape(x.name)
         factor_rows += (
-            f"<tr><td>{x.group}</td><td>{x.name}</td><td>{x.weight}</td>"
+            f"<tr><td>{group_esc}</td><td>{name_esc}</td><td>{x.weight}</td>"
             f"<td>{sig_str}</td><td>{val_str}</td><td>{miss}</td>"
-            f"<td style='font-size:11px;color:#555'>{x.detail[:80]}</td></tr>\n"
+            f"<td style='font-size:11px;color:#555'>{detail_esc}</td></tr>\n"
         )
 
-    warn_rows = "".join(f"<li>{w}</li>" for w in result.warnings[:30])
-    path_rows = "".join(f"<li>{p}</li>" for p in result.decision_path)
+    warn_rows = "".join(f"<li>{_html.escape(w)}</li>" for w in result.warnings[:30])
+    path_rows = "".join(f"<li>{_html.escape(p)}</li>" for p in result.decision_path)
 
     # Run history chart (simple inline table)
     history_path = OUTPUT_DIR / "run_history.csv"

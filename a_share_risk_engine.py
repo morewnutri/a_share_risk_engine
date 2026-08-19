@@ -54,8 +54,6 @@ YF_TICKERS = {
     "CHINEXT": "399006.SZ",
     "STAR50": "000688.SS",
     "HSI": "^HSI",
-    "HSTECH": "^HSTECH",
-    "A50": "XIN9.SI",
     "VIX": "^VIX",
     "NASDAQ100": "^NDX",
     "SOX": "^SOX",
@@ -68,6 +66,19 @@ YF_TICKERS = {
     "OIL": "CL=F",
     "IRON_ORE": "TIO=F",
 }
+
+# HSTECH: try these tickers in order before giving up
+HSTECH_CANDIDATES = [
+    ("3067.HK", "ETF proxy"),
+    ("3033.HK", "ETF proxy"),
+    ("^HSTECH", "direct index"),
+]
+
+# A50: try these tickers in order
+A50_CANDIDATES = [
+    ("2823.HK", "ETF proxy"),
+    ("XIN9.SI", "ETF proxy"),
+]
 
 AK_INDEX_SYMBOLS = {
     "SSE": "sh000001",
@@ -237,34 +248,119 @@ class DataHub:
     def source(self, key: str) -> str:
         return self.series[key].source if key in self.series else "MISSING"
 
+    @staticmethod
+    def _yf_close(ticker: str, start: str, end: str) -> Optional[pd.Series]:
+        """Download a single ticker from yfinance and return a clean Close series, or None."""
+        if yf is None:
+            return None
+        try:
+            df = yf.download(
+                ticker,
+                start=start,
+                end=end,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if df is None or df.empty:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                close = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+            else:
+                close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
+            close = pd.to_numeric(close, errors="coerce").dropna()
+            close.index = pd.to_datetime(close.index).tz_localize(None)
+            close = close[~close.index.duplicated(keep="last")].sort_index()
+            return close if len(close) > 0 else None
+        except Exception:
+            return None
+
     def fetch_yfinance(self) -> None:
         if yf is None:
             self.warnings.append("未安装 yfinance：海外指数/汇率/商品等自动行情将缺失。")
             return
         end = datetime.now().date() + timedelta(days=1)
         start = end - timedelta(days=self.history_days * 2)
+        start_s, end_s = start.isoformat(), end.isoformat()
+
+        # Standard tickers
         for key, ticker in YF_TICKERS.items():
-            try:
-                df = yf.download(
-                    ticker,
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                )
-                if df is None or df.empty:
-                    self.warnings.append(f"yfinance 无数据: {key} ({ticker})")
-                    continue
-                if isinstance(df.columns, pd.MultiIndex):
-                    close = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
-                    if isinstance(close, pd.DataFrame):
-                        close = close.iloc[:, 0]
-                else:
-                    close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
-                self.add(key, close, f"Yahoo Finance via yfinance ({ticker})")
-            except Exception as e:
-                self.warnings.append(f"yfinance 获取失败 {key}({ticker}): {e}")
+            s = self._yf_close(ticker, start_s, end_s)
+            if s is not None:
+                self.add(key, s, f"Yahoo Finance via yfinance ({ticker})")
+            else:
+                self.warnings.append(f"yfinance 无数据: {key} ({ticker})")
+
+        # HSTECH fallback chain: 3067.HK -> 3033.HK -> ^HSTECH -> AKShare
+        for ticker, kind in HSTECH_CANDIDATES:
+            s = self._yf_close(ticker, start_s, end_s)
+            if s is not None:
+                self.add("HSTECH", s, f"Yahoo Finance via yfinance ({ticker}, {kind})")
+                break
+        if "HSTECH" not in self.series:
+            # Try AKShare HK index history as last resort
+            self._fetch_hstech_akshare()
+
+        # A50 fallback chain: 2823.HK -> XIN9.SI -> SSE50 proxy via AKShare
+        for ticker, kind in A50_CANDIDATES:
+            s = self._yf_close(ticker, start_s, end_s)
+            if s is not None:
+                self.add("A50", s, f"Yahoo Finance via yfinance ({ticker}, {kind})")
+                break
+        if "A50" not in self.series:
+            # Try SSE50 (000016) via AKShare as proxy
+            self._fetch_a50_akshare_proxy()
+
+    def _fetch_hstech_akshare(self) -> None:
+        """AKShare-backed HSTECH fallback: try HK index history."""
+        if ak is None:
+            self.warnings.append("HSTECH: yfinance 所有候选均失败，且未安装 AKShare，数据缺失。")
+            return
+        try:
+            # Try stock_hk_index_daily_em if available
+            if hasattr(ak, "stock_hk_index_daily_em"):
+                df = ak.stock_hk_index_daily_em(symbol="恒生科技指数")
+                if df is not None and not df.empty:
+                    s = self._normalize_ak_ohlc(df, "HSTECH")
+                    if s is not None:
+                        self.add("HSTECH", s, "AKShare:stock_hk_index_daily_em (fallback, direct index)")
+                        return
+        except Exception as e:
+            self.warnings.append(f"HSTECH AKShare fallback 失败: {e}")
+        self.warnings.append("HSTECH: 所有数据源均失败，数据缺失。请检查网络或 AKShare 版本。")
+
+    def _fetch_a50_akshare_proxy(self) -> None:
+        """AKShare SSE50 (000016) as A50 proxy when yfinance fails."""
+        if ak is None:
+            self.warnings.append("A50: yfinance 所有候选均失败，且未安装 AKShare，数据缺失。")
+            return
+        symbol = "sh000016"  # SSE50
+        try:
+            df = ak.stock_zh_index_daily_em(symbol=symbol)
+            if df is not None and not df.empty:
+                s = self._normalize_ak_ohlc(df, "A50")
+                if s is not None:
+                    self.add("A50", s, "AKShare:stock_zh_index_daily_em(sh000016) (proxy=SSE50, fallback)")
+                    self.warnings.append("A50: 使用 SSE50 (sh000016) 作为代理，非直接 A50 指数，请注意！")
+                    return
+        except Exception as e:
+            self.warnings.append(f"A50 AKShare SSE50 proxy fallback 失败: {e}")
+        self.warnings.append("A50: 所有数据源均失败，数据缺失。")
+
+    @staticmethod
+    def _normalize_ak_ohlc(df: pd.DataFrame, key: str) -> Optional[pd.Series]:
+        """Extract a clean date-indexed close series from a typical AKShare OHLC DataFrame."""
+        date_col = DataHub._find_col(df, ["date", "日期"])
+        close_col = DataHub._find_col(df, ["close", "收盘"])
+        if not date_col or not close_col:
+            return None
+        idx = pd.to_datetime(df[date_col], errors="coerce")
+        vals = pd.to_numeric(df[close_col], errors="coerce")
+        s = pd.Series(vals.values, index=idx).dropna()
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        return s if len(s) > 0 else None
 
     def fetch_fred(self) -> None:
         api_key = os.getenv("FRED_API_KEY", "").strip()
@@ -334,94 +430,181 @@ class DataHub:
         if ak is None:
             return
         for key, symbol in AK_INDEX_SYMBOLS.items():
+            self._fetch_single_a_index(key, symbol)
+
+    def _fetch_single_a_index(self, key: str, symbol: str) -> None:
+        """Fetch one A-share index with fallback ladder."""
+        # Attempt 1: stock_zh_index_daily_em
+        df = None
+        source_used = None
+        try:
+            df = ak.stock_zh_index_daily_em(symbol=symbol)
+            if df is not None and not df.empty:
+                source_used = f"AKShare:stock_zh_index_daily_em({symbol})"
+        except Exception as e:
+            self.warnings.append(f"A股指数历史 stock_zh_index_daily_em 失败 {key}({symbol}): {e}")
+
+        # Attempt 2: index_zh_a_hist (newer AKShare path)
+        if df is None or df.empty:
             try:
-                df = ak.stock_zh_index_daily_em(symbol=symbol)
-                if df is None or df.empty:
-                    self.warnings.append(f"A股指数历史为空: {key}({symbol})")
-                    continue
-                date_col = self._find_col(df, ["date", "日期"])
-                close_col = self._find_col(df, ["close", "收盘"])
-                amount_col = self._find_col(df, ["amount", "成交额"])
-                volume_col = self._find_col(df, ["volume", "成交量"])
-                if not date_col:
-                    self.warnings.append(f"A股指数历史缺日期列: {key}")
-                    continue
-                idx = pd.to_datetime(df[date_col], errors="coerce")
-                if close_col and key not in self.series:
-                    self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if amount_col:
-                    self.add(key+"_INDEX_AMOUNT",
-                             pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if volume_col:
-                    self.add(key+"_INDEX_VOLUME",
-                             pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
+                if hasattr(ak, "index_zh_a_hist"):
+                    # symbol for index_zh_a_hist uses different format e.g. "000300" not "sh000300"
+                    sym2 = symbol.lstrip("sh").lstrip("sz")
+                    df2 = ak.index_zh_a_hist(symbol=sym2, period="daily")
+                    if df2 is not None and not df2.empty:
+                        df = df2
+                        source_used = f"AKShare:index_zh_a_hist({sym2})"
             except Exception as e:
-                self.warnings.append(f"A股指数历史获取失败 {key}({symbol}): {e}")
+                self.warnings.append(f"A股指数历史 index_zh_a_hist fallback 失败 {key}: {e}")
+
+        # Attempt 3: existing local cached close (no amount data but at least price)
+        if (df is None or df.empty) and key in self.series:
+            self.warnings.append(f"A股指数历史 {key}({symbol}): 使用已有缓存数据，成交额不可用。")
+            return
+
+        if df is None or df.empty:
+            self.warnings.append(f"A股指数历史为空: {key}({symbol})")
+            return
+
+        date_col = self._find_col(df, ["date", "日期"])
+        close_col = self._find_col(df, ["close", "收盘"])
+        amount_col = self._find_col(df, ["amount", "成交额"])
+        volume_col = self._find_col(df, ["volume", "成交量"])
+        if not date_col:
+            self.warnings.append(f"A股指数历史缺日期列: {key}")
+            return
+        idx = pd.to_datetime(df[date_col], errors="coerce")
+        idx = idx.dt.tz_localize(None) if hasattr(idx, "dt") else idx
+        if close_col and key not in self.series:
+            self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
+                     source_used)
+        if amount_col:
+            self.add(key+"_INDEX_AMOUNT",
+                     pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
+                     source_used)
+        if volume_col:
+            self.add(key+"_INDEX_VOLUME",
+                     pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
+                     source_used)
 
     def fetch_a_share_snapshot(self) -> None:
         if ak is None:
+            self._load_stale_snapshot_fallback()
             return
+
+        df = None
+        snap_source = None
+
+        # Attempt 1: stock_zh_a_spot_em
         try:
             df = ak.stock_zh_a_spot_em()
-            if df is None or df.empty:
-                self.warnings.append("A股实时横截面为空。")
-                return
-
-            pct_col = self._find_col(df, ["涨跌幅"])
-            amount_col = self._find_col(df, ["成交额"])
-            if not pct_col:
-                self.warnings.append("A股横截面缺少涨跌幅列，无法计算市场宽度。")
-                return
-
-            pct = pd.to_numeric(df[pct_col], errors="coerce").dropna()
-            n = len(pct)
-            if n == 0:
-                return
-
-            adv = float((pct > 0).sum() / n)
-            dec = float((pct < 0).sum() / n)
-            strong = float((pct >= 3).sum() / n)
-            weak = float((pct <= -3).sum() / n)
-            approx_limit_down = int((pct <= -9.5).sum())
-            approx_limit_down_ratio = float(approx_limit_down / n)
-
-            total_amount = np.nan
-            if amount_col:
-                total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
-
-            now = pd.Timestamp.now().normalize()
-            self.add("A_BREADTH", pd.Series([adv], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_DECLINERS", pd.Series([dec], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_STRONG3", pd.Series([strong], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_WEAK3", pd.Series([weak], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), "AKShare:stock_zh_a_spot_em")
-            if not math.isnan(total_amount):
-                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), "AKShare:stock_zh_a_spot_em")
-
-            self._save_snapshot({
-                "date": now.strftime("%Y-%m-%d"),
-                "breadth": adv,
-                "decliners": dec,
-                "strong3": strong,
-                "weak3": weak,
-                "limit_down_approx": approx_limit_down,
-                "limit_down_ratio": approx_limit_down_ratio,
-                "turnover": None if math.isnan(total_amount) else total_amount,
-            })
-
-            hist = self._load_snapshot_history()
-            if not hist.empty:
-                hist.index = pd.to_datetime(hist["date"])
-                if "breadth" in hist:
-                    self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history")
-                if "turnover" in hist:
-                    self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
+            if df is not None and not df.empty:
+                snap_source = "AKShare:stock_zh_a_spot_em (live)"
         except Exception as e:
-            self.warnings.append(f"A股横截面获取失败: {e}")
+            self.warnings.append(f"A股横截面 stock_zh_a_spot_em 失败: {e}")
+
+        # Attempt 2: stock_zh_a_spot
+        if df is None or df.empty:
+            try:
+                if hasattr(ak, "stock_zh_a_spot"):
+                    df = ak.stock_zh_a_spot()
+                    if df is not None and not df.empty:
+                        snap_source = "AKShare:stock_zh_a_spot (live, fallback)"
+            except Exception as e:
+                self.warnings.append(f"A股横截面 stock_zh_a_spot fallback 失败: {e}")
+
+        if df is None or df.empty:
+            self.warnings.append("A股实时横截面为空，尝试使用本地快照文件作为降级回退。")
+            self._load_stale_snapshot_fallback()
+            return
+
+        self._process_snapshot_df(df, snap_source)
+
+    def _process_snapshot_df(self, df: pd.DataFrame, snap_source: str) -> None:
+        pct_col = self._find_col(df, ["涨跌幅"])
+        amount_col = self._find_col(df, ["成交额"])
+        if not pct_col:
+            self.warnings.append("A股横截面缺少涨跌幅列，无法计算市场宽度。")
+            return
+
+        pct = pd.to_numeric(df[pct_col], errors="coerce").dropna()
+        n = len(pct)
+        if n == 0:
+            return
+
+        adv = float((pct > 0).sum() / n)
+        dec = float((pct < 0).sum() / n)
+        strong = float((pct >= 3).sum() / n)
+        weak = float((pct <= -3).sum() / n)
+        approx_limit_down = int((pct <= -9.5).sum())
+        approx_limit_down_ratio = float(approx_limit_down / n)
+
+        total_amount = np.nan
+        if amount_col:
+            total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
+
+        now = pd.Timestamp.now().normalize()
+        self.add("A_BREADTH", pd.Series([adv], index=[now]), snap_source)
+        self.add("A_DECLINERS", pd.Series([dec], index=[now]), snap_source)
+        self.add("A_STRONG3", pd.Series([strong], index=[now]), snap_source)
+        self.add("A_WEAK3", pd.Series([weak], index=[now]), snap_source)
+        self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), snap_source)
+        self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), snap_source)
+        if not math.isnan(total_amount):
+            self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), snap_source)
+
+        self._save_snapshot({
+            "date": now.strftime("%Y-%m-%d"),
+            "breadth": adv,
+            "decliners": dec,
+            "strong3": strong,
+            "weak3": weak,
+            "limit_down_approx": approx_limit_down,
+            "limit_down_ratio": approx_limit_down_ratio,
+            "turnover": None if math.isnan(total_amount) else total_amount,
+        })
+
+        hist = self._load_snapshot_history()
+        if not hist.empty:
+            hist.index = pd.to_datetime(hist["date"])
+            if "breadth" in hist:
+                self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history")
+            if "turnover" in hist:
+                self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
+
+    def _load_stale_snapshot_fallback(self) -> None:
+        """Use the last saved snapshot CSV as a stale fallback with explicit warning."""
+        hist = self._load_snapshot_history()
+        if hist.empty:
+            self.warnings.append("A股横截面: 无实时数据，且无本地快照文件可用。A_BREADTH 将缺失。")
+            return
+        try:
+            hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+            hist = hist.dropna(subset=["date"]).sort_values("date")
+            last = hist.iloc[-1]
+            stale_date = last["date"]
+            age_days = (pd.Timestamp.now().normalize() - pd.Timestamp(stale_date).normalize()).days
+            stale_source = f"stale snapshot (date={stale_date.date() if hasattr(stale_date,'date') else stale_date}, age={age_days}d)"
+            self.warnings.append(
+                f"⚠ A股横截面使用过期本地快照 [{stale_source}]，非实时数据！"
+            )
+            now = pd.Timestamp.now().normalize()
+            for field, key in [("breadth","A_BREADTH"),("decliners","A_DECLINERS"),
+                                ("strong3","A_STRONG3"),("weak3","A_WEAK3"),
+                                ("limit_down_approx","A_LIMIT_DOWN_APPROX"),
+                                ("limit_down_ratio","A_LIMIT_DOWN_RATIO"),
+                                ("turnover","A_TURNOVER")]:
+                if field in last and pd.notna(last[field]):
+                    self.add(key, pd.Series([float(last[field])], index=[now]),
+                             stale_source)
+            # also load breadth/turnover history for MA calcs
+            hist.index = hist["date"]
+            if "breadth" in hist:
+                self.add("A_BREADTH_HIST", hist["breadth"].dropna(), "local snapshot history (stale)")
+            if "turnover" in hist:
+                self.add("A_TURNOVER_HIST", hist["turnover"].dropna(), "local snapshot history (stale)")
+        except Exception as e:
+            self.warnings.append(f"A股本地快照 fallback 处理失败: {e}")
 
     def fetch_margin(self) -> None:
         if ak is None:
@@ -1107,6 +1290,29 @@ def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> 
         OUTPUT_DIR / "feature_snapshot.csv", index=False, encoding="utf-8-sig"
     )
     save_decision_tree()
+
+    # Append to run_history.csv for dashboard trending
+    hist_path = OUTPUT_DIR / "run_history.csv"
+    row = {
+        "timestamp": result.timestamp,
+        "buy_score": result.buy_score,
+        "sell_score": result.sell_score,
+        "confidence": result.confidence,
+        "action": result.action,
+        "risk_level": result.risk_level,
+        "resonance_adjustment": result.resonance_adjustment,
+    }
+    new_row = pd.DataFrame([row])
+    if hist_path.exists():
+        existing = pd.read_csv(hist_path)
+        combined = pd.concat([existing, new_row], ignore_index=True)
+        # Deduplicate by date (keep last run per calendar day)
+        combined["_date"] = pd.to_datetime(combined["timestamp"], errors="coerce", utc=True).dt.date
+        combined = combined.drop_duplicates(subset=["_date"], keep="last").drop(columns=["_date"])
+        combined = combined.sort_values("timestamp").reset_index(drop=True)
+    else:
+        combined = new_row
+    combined.to_csv(hist_path, index=False, encoding="utf-8-sig")
 
 def calibration_notes() -> str:
     return """

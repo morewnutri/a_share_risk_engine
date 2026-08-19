@@ -74,17 +74,28 @@ def load_snapshot_history() -> pd.DataFrame:
 # ── Reload button ────────────────────────────────────────────────────────────
 
 if st.button("🔄 刷新数据（重新运行引擎）"):
-    import subprocess, sys
-    with st.spinner("运行引擎中..."):
-        result = subprocess.run(
-            [sys.executable, "a_share_risk_engine.py"],
-            capture_output=True, text=True,
-        )
-    if result.returncode == 0:
-        st.success("引擎运行完成！")
-    else:
-        st.error("引擎运行出错")
-        st.code(result.stderr[-3000:] if result.stderr else "(无错误输出)")
+    # Basic cooldown: check time of last run from run_history
+    _hist_for_cooldown = load_run_history(1)
+    _cooldown_ok = True
+    if not _hist_for_cooldown.empty:
+        _last_ts = _hist_for_cooldown["timestamp"].max()
+        if pd.notna(_last_ts):
+            _age_min = (pd.Timestamp.now(tz="UTC") - _last_ts).total_seconds() / 60
+            if _age_min < 5:
+                st.warning(f"上次运行距现在仅 {_age_min:.1f} 分钟，请至少等待 5 分钟后再刷新。")
+                _cooldown_ok = False
+    if _cooldown_ok:
+        import subprocess, sys
+        with st.spinner("运行引擎中..."):
+            result = subprocess.run(
+                [sys.executable, "a_share_risk_engine.py"],
+                capture_output=True, text=True,
+            )
+        if result.returncode == 0:
+            st.success("引擎运行完成！")
+        else:
+            st.error("引擎运行出错")
+            st.code(result.stderr[-3000:] if result.stderr else "(无错误输出)")
 
 # ── Latest scores ─────────────────────────────────────────────────────────────
 

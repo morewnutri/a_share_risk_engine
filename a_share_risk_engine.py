@@ -449,7 +449,8 @@ class DataHub:
             try:
                 if hasattr(ak, "index_zh_a_hist"):
                     # symbol for index_zh_a_hist uses different format e.g. "000300" not "sh000300"
-                    sym2 = symbol.lstrip("sh").lstrip("sz")
+                    import re as _re
+                    sym2 = _re.sub(r'^(sh|sz)', '', symbol)
                     df2 = ak.index_zh_a_hist(symbol=sym2, period="daily")
                     if df2 is not None and not df2.empty:
                         df = df2
@@ -1309,7 +1310,9 @@ def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> 
         # Deduplicate by date (keep last run per calendar day)
         combined["_date"] = pd.to_datetime(combined["timestamp"], errors="coerce", utc=True).dt.date
         combined = combined.drop_duplicates(subset=["_date"], keep="last").drop(columns=["_date"])
-        combined = combined.sort_values("timestamp").reset_index(drop=True)
+        # Sort by datetime (parse first to handle timezone-offset ISO strings correctly)
+        combined["_ts_sort"] = pd.to_datetime(combined["timestamp"], errors="coerce", utc=True)
+        combined = combined.sort_values("_ts_sort").drop(columns=["_ts_sort"]).reset_index(drop=True)
     else:
         combined = new_row
     combined.to_csv(hist_path, index=False, encoding="utf-8-sig")

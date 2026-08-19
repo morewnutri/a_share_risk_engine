@@ -1,0 +1,416 @@
+{
+  "timestamp": "2026-08-19T11:15:35+00:00",
+  "buy_score": 50.0,
+  "sell_score": 50.0,
+  "confidence": 0.0,
+  "action": "DATA_INCOMPLETE / 不根据信号交易",
+  "risk_level": "中性",
+  "resonance_adjustment": 0.0,
+  "missing_critical": [
+    "A_BREADTH",
+    "CSI300",
+    "HSTECH",
+    "US10Y",
+    "US10Y_REAL",
+    "USDCNH",
+    "VIX"
+  ],
+  "warnings": [
+    "关键数据缺失: A_BREADTH, CSI300, HSTECH, US10Y, US10Y_REAL, USDCNH, VIX"
+  ],
+  "factors": [
+    {
+      "name": "美债10Y绝对水平",
+      "group": "全球利率",
+      "weight": 5.0,
+      "signal": null,
+      "value": null,
+      "detail": "缺失",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "美债10Y斜率/变化速度",
+      "group": "全球利率",
+      "weight": 8.0,
+      "signal": null,
+      "value": null,
+      "detail": "5日=Nonebp, 20日=Nonebp；快速上行权重高于绝对值",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "美债10Y实际利率",
+      "group": "全球利率",
+      "weight": 8.5,
+      "signal": null,
+      "value": null,
+      "detail": "缺失",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "美债2Y/Fed预期重定价",
+      "group": "全球利率",
+      "weight": 5.0,
+      "signal": null,
+      "value": null,
+      "detail": "2Y: 5日=Nonebp, 20日=Nonebp",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "美联储政策利率方向",
+      "group": "央行政策",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "Fed Funds=None%, 20日变化=Nonebp；低权重",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "日本央行政策利率方向",
+      "group": "央行政策",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "BOJ=None%, 20日变化=Nonebp",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "美国高收益债OAS",
+      "group": "全球信用",
+      "weight": 4.0,
+      "signal": null,
+      "value": null,
+      "detail": "HY OAS=None%, 5日变化=Nonebp",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "离岸人民币USD/CNH",
+      "group": "汇率",
+      "weight": 8.5,
+      "signal": null,
+      "value": null,
+      "detail": "现值=None, 5日=None%, 20日=None%；上涨=人民币走弱",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "美元指数DXY",
+      "group": "汇率",
+      "weight": 4.5,
+      "signal": null,
+      "value": null,
+      "detail": "DXY=None, 5日=None%, 20日=None%",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "中美10Y国债利差",
+      "group": "汇率",
+      "weight": 3.0,
+      "signal": null,
+      "value": null,
+      "detail": "CN-US=Nonebp, 20日变化=Nonebp",
+      "source": "MISSING + MISSING",
+      "missing": true
+    },
+    {
+      "name": "VIX恐慌指数",
+      "group": "全球风险",
+      "weight": 7.5,
+      "signal": null,
+      "value": null,
+      "detail": "VIX=None, 5日=None%",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "恒生科技",
+      "group": "中国资产外盘",
+      "weight": 6.0,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "恒生指数",
+      "group": "中国资产外盘",
+      "weight": 3.0,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "富时中国A50",
+      "group": "中国资产外盘",
+      "weight": 4.0,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "纳斯达克100",
+      "group": "全球科技",
+      "weight": 3.5,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "费城半导体SOX",
+      "group": "全球科技",
+      "weight": 4.5,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "日经225",
+      "group": "亚洲风险",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "韩国KOSPI",
+      "group": "亚洲/半导体周期",
+      "weight": 1.5,
+      "signal": null,
+      "value": null,
+      "detail": "1日=None%, 5日=None%, 20日=None%；看变化速度",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "日元套息平仓风险",
+      "group": "亚洲流动性",
+      "weight": 3.0,
+      "signal": null,
+      "value": null,
+      "detail": "USDJPY 1日=None%, 5日=None%；负值越大=日元升值越快",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "铜价趋势",
+      "group": "商品/增长",
+      "weight": 1.5,
+      "signal": null,
+      "value": null,
+      "detail": "铜20日=None%；大跌偏风险，大涨只给有限利多",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "原油趋势",
+      "group": "商品/通胀",
+      "weight": 1.5,
+      "signal": null,
+      "value": null,
+      "detail": "原油20日=None%；暴涨=通胀风险，暴跌=需求/信用风险",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "铁矿石趋势",
+      "group": "商品/中国需求",
+      "weight": 1.0,
+      "signal": null,
+      "value": null,
+      "detail": "铁矿20日=None%；仅作为中国周期温度计",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "沪深300自身趋势",
+      "group": "A股内部",
+      "weight": 5.0,
+      "signal": null,
+      "value": null,
+      "detail": "5日=None%, 20日=None%；确认外部冲击是否传入",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "创业板趋势",
+      "group": "A股内部",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "5日=None%, 20日=None%",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "科创50趋势",
+      "group": "A股内部",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "5日=None%, 20日=None%",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "中证1000趋势",
+      "group": "A股内部",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "5日=None%, 20日=None%",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "A股上涨家数比例",
+      "group": "A股内部",
+      "weight": 5.5,
+      "signal": null,
+      "value": null,
+      "detail": "上涨比例=None%；<30%偏空，>60%偏多",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "A股强弱扩散差",
+      "group": "A股内部",
+      "weight": 2.5,
+      "signal": null,
+      "value": null,
+      "detail": "跌幅>=3%占比 - 涨幅>=3%占比 = None；正值越大说明弱股扩散",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "A股近似跌停比例",
+      "group": "A股内部",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "近似跌停股占全部A股=None%；使用比例而非固定家数",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "沪深300成交额确认",
+      "group": "A股成交结构",
+      "weight": 1.5,
+      "signal": null,
+      "value": null,
+      "detail": "成交额/MA20=None, 指数5日=None%；放量只用于确认方向",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "中证1000成交额确认",
+      "group": "A股成交结构",
+      "weight": 1.2,
+      "signal": null,
+      "value": null,
+      "detail": "成交额/MA20=None, 指数5日=None%；放量只用于确认方向",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "创业板成交额确认",
+      "group": "A股成交结构",
+      "weight": 1.2,
+      "signal": null,
+      "value": null,
+      "detail": "成交额/MA20=None, 指数5日=None%；放量只用于确认方向",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "科创50成交额确认",
+      "group": "A股成交结构",
+      "weight": 1.2,
+      "signal": null,
+      "value": null,
+      "detail": "成交额/MA20=None, 指数5日=None%；放量只用于确认方向",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "A股成交额/MA20",
+      "group": "A股内部",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "成交额比=None；量本身无方向，主要用于共振规则",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "融资余额变化",
+      "group": "A股内部",
+      "weight": 2.5,
+      "signal": null,
+      "value": null,
+      "detail": "5日=None%, 20日=None%；持续下降偏风险",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "主要宽基ETF 5日净流入",
+      "group": "A股资金",
+      "weight": 2.0,
+      "signal": null,
+      "value": null,
+      "detail": "5日净流入=None亿元；正值偏多",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "IF基差",
+      "group": "A股衍生品",
+      "weight": 1.0,
+      "signal": null,
+      "value": null,
+      "detail": "IF_BASIS_PCT=None%；负值贴水偏风险",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "IC基差",
+      "group": "A股衍生品",
+      "weight": 0.8,
+      "signal": null,
+      "value": null,
+      "detail": "IC_BASIS_PCT=None%；负值贴水偏风险",
+      "source": "MISSING",
+      "missing": true
+    },
+    {
+      "name": "IM基差",
+      "group": "A股衍生品",
+      "weight": 0.8,
+      "signal": null,
+      "value": null,
+      "detail": "IM_BASIS_PCT=None%；负值贴水偏风险",
+      "source": "MISSING",
+      "missing": true
+    }
+  ],
+  "decision_path": [
+    "数据置信度=0.0，或关键数据缺失过多 -> DATA_INCOMPLETE"
+  ]
+}

@@ -47,26 +47,29 @@ STATE_DIR = Path("state")
 OUTPUT_DIR = Path("output")
 MANUAL_FILE = Path("manual_overrides.json")
 
-YF_TICKERS = {
-    "SSE": "000001.SS",
-    "CSI300": "000300.SS",
-    "CSI1000": "000852.SS",
-    "CHINEXT": "399006.SZ",
-    "STAR50": "000688.SS",
-    "HSI": "^HSI",
-    "HSTECH": "^HSTECH",
-    "A50": "XIN9.SI",
-    "VIX": "^VIX",
-    "NASDAQ100": "^NDX",
-    "SOX": "^SOX",
-    "DXY": "DX-Y.NYB",
-    "NIKKEI": "^N225",
-    "KOSPI": "^KS11",
-    "USDCNH": "CNH=X",
-    "USDJPY": "JPY=X",
-    "COPPER": "HG=F",
-    "OIL": "CL=F",
-    "IRON_ORE": "TIO=F",
+# For each key, a list of candidate tickers tried in order until one succeeds.
+# HSTECH: ^HSTECH often returns 404; use HK-listed HSTECH ETF proxies as fallback.
+# A50: XIN9.SI frequently fails; try alternative listings.
+YF_TICKERS: Dict[str, List[str]] = {
+    "SSE":      ["000001.SS"],
+    "CSI300":   ["000300.SS"],
+    "CSI1000":  ["000852.SS"],
+    "CHINEXT":  ["399006.SZ"],
+    "STAR50":   ["000688.SS"],
+    "HSI":      ["^HSI"],
+    "HSTECH":   ["^HSTECH", "3033.HK", "3067.HK", "2838.HK"],  # ETF proxies
+    "A50":      ["XIN9.SI", "2823.HK", "CNYA", "FXI"],          # HK ETF + US ETF proxies
+    "VIX":      ["^VIX"],
+    "NASDAQ100":["^NDX"],
+    "SOX":      ["^SOX"],
+    "DXY":      ["DX-Y.NYB"],
+    "NIKKEI":   ["^N225"],
+    "KOSPI":    ["^KS11"],
+    "USDCNH":   ["CNH=X"],
+    "USDJPY":   ["JPY=X"],
+    "COPPER":   ["HG=F"],
+    "OIL":      ["CL=F"],
+    "IRON_ORE": ["TIO=F"],
 }
 
 AK_INDEX_SYMBOLS = {
@@ -243,28 +246,38 @@ class DataHub:
             return
         end = datetime.now().date() + timedelta(days=1)
         start = end - timedelta(days=self.history_days * 2)
-        for key, ticker in YF_TICKERS.items():
-            try:
-                df = yf.download(
-                    ticker,
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                )
-                if df is None or df.empty:
-                    self.warnings.append(f"yfinance 无数据: {key} ({ticker})")
-                    continue
-                if isinstance(df.columns, pd.MultiIndex):
-                    close = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
-                    if isinstance(close, pd.DataFrame):
-                        close = close.iloc[:, 0]
-                else:
-                    close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
-                self.add(key, close, f"Yahoo Finance via yfinance ({ticker})")
-            except Exception as e:
-                self.warnings.append(f"yfinance 获取失败 {key}({ticker}): {e}")
+        for key, tickers in YF_TICKERS.items():
+            succeeded = False
+            last_err: List[str] = []
+            for ticker in tickers:
+                try:
+                    df = yf.download(
+                        ticker,
+                        start=start.isoformat(),
+                        end=end.isoformat(),
+                        auto_adjust=False,
+                        progress=False,
+                        threads=False,
+                    )
+                    if df is None or df.empty:
+                        last_err.append(f"{ticker}: 无数据")
+                        continue
+                    if isinstance(df.columns, pd.MultiIndex):
+                        close = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
+                        if isinstance(close, pd.DataFrame):
+                            close = close.iloc[:, 0]
+                    else:
+                        close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
+                    label = f"Yahoo Finance via yfinance ({ticker})"
+                    if ticker != tickers[0]:
+                        label += f" [代理/fallback，主ticker={tickers[0]} 失败]"
+                    self.add(key, close, label)
+                    succeeded = True
+                    break
+                except Exception as e:
+                    last_err.append(f"{ticker}: {e}")
+            if not succeeded:
+                self.warnings.append(f"yfinance 所有候选 ticker 均失败 {key} {tickers}: {'; '.join(last_err)}")
 
     def fetch_fred(self) -> None:
         api_key = os.getenv("FRED_API_KEY", "").strip()
@@ -330,98 +343,168 @@ class DataHub:
             self.warnings.append(f"AKShare 中美国债收益率获取失败: {e}")
 
     def fetch_a_index_history(self) -> None:
-        """用 AKShare 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。"""
+        """用 AKShare 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。
+        主接口 stock_zh_index_daily_em 失败时尝试 stock_zh_index_daily 作为回退。
+        """
         if ak is None:
             return
         for key, symbol in AK_INDEX_SYMBOLS.items():
-            try:
-                df = ak.stock_zh_index_daily_em(symbol=symbol)
-                if df is None or df.empty:
-                    self.warnings.append(f"A股指数历史为空: {key}({symbol})")
-                    continue
-                date_col = self._find_col(df, ["date", "日期"])
-                close_col = self._find_col(df, ["close", "收盘"])
-                amount_col = self._find_col(df, ["amount", "成交额"])
-                volume_col = self._find_col(df, ["volume", "成交量"])
-                if not date_col:
-                    self.warnings.append(f"A股指数历史缺日期列: {key}")
-                    continue
-                idx = pd.to_datetime(df[date_col], errors="coerce")
-                if close_col and key not in self.series:
-                    self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if amount_col:
-                    self.add(key+"_INDEX_AMOUNT",
-                             pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if volume_col:
-                    self.add(key+"_INDEX_VOLUME",
-                             pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-            except Exception as e:
-                self.warnings.append(f"A股指数历史获取失败 {key}({symbol}): {e}")
+            # Build a list of (callable, label) fallbacks to try in order.
+            def _try_em(sym=symbol):
+                return ak.stock_zh_index_daily_em(symbol=sym)
+
+            def _try_plain(sym=symbol):
+                if hasattr(ak, "stock_zh_index_daily"):
+                    return ak.stock_zh_index_daily(symbol=sym)
+                return None
+
+            attempts = [(_try_em, f"stock_zh_index_daily_em({symbol})"),
+                        (_try_plain, f"stock_zh_index_daily({symbol}) [fallback]")]
+            df = None
+            used_label = ""
+            for fn, label in attempts:
+                try:
+                    df = fn()
+                    if df is not None and not df.empty:
+                        used_label = label
+                        break
+                    df = None
+                except Exception as e:
+                    self.warnings.append(f"A股指数历史尝试 {label} 失败: {e}")
+                    df = None
+
+            if df is None or df.empty:
+                self.warnings.append(f"A股指数历史所有来源均失败: {key}({symbol})")
+                continue
+
+            date_col = self._find_col(df, ["date", "日期"])
+            close_col = self._find_col(df, ["close", "收盘"])
+            amount_col = self._find_col(df, ["amount", "成交额"])
+            volume_col = self._find_col(df, ["volume", "成交量"])
+            if not date_col:
+                self.warnings.append(f"A股指数历史缺日期列: {key}")
+                continue
+            idx = pd.to_datetime(df[date_col], errors="coerce")
+            if close_col and key not in self.series:
+                self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
+                         f"AKShare:{used_label}")
+            if amount_col:
+                self.add(key+"_INDEX_AMOUNT",
+                         pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
+                         f"AKShare:{used_label}")
+            if volume_col:
+                self.add(key+"_INDEX_VOLUME",
+                         pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
+                         f"AKShare:{used_label}")
 
     def fetch_a_share_snapshot(self) -> None:
         if ak is None:
+            self._load_stale_breadth_fallback()
             return
-        try:
-            df = ak.stock_zh_a_spot_em()
-            if df is None or df.empty:
-                self.warnings.append("A股实时横截面为空。")
-                return
+        fetched = False
+        for attempt_fn, label in [
+            (lambda: ak.stock_zh_a_spot_em(), "stock_zh_a_spot_em"),
+            (lambda: ak.stock_zh_a_spot_em() if hasattr(ak, "stock_zh_a_spot_em") else None, "stock_zh_a_spot_em-retry"),
+        ]:
+            try:
+                df = attempt_fn()
+                if df is None or df.empty:
+                    self.warnings.append(f"A股实时横截面为空 ({label})。")
+                    continue
 
-            pct_col = self._find_col(df, ["涨跌幅"])
-            amount_col = self._find_col(df, ["成交额"])
-            if not pct_col:
-                self.warnings.append("A股横截面缺少涨跌幅列，无法计算市场宽度。")
-                return
+                pct_col = self._find_col(df, ["涨跌幅"])
+                amount_col = self._find_col(df, ["成交额"])
+                if not pct_col:
+                    self.warnings.append("A股横截面缺少涨跌幅列，无法计算市场宽度。")
+                    break
 
-            pct = pd.to_numeric(df[pct_col], errors="coerce").dropna()
-            n = len(pct)
-            if n == 0:
-                return
+                pct = pd.to_numeric(df[pct_col], errors="coerce").dropna()
+                n = len(pct)
+                if n == 0:
+                    break
 
-            adv = float((pct > 0).sum() / n)
-            dec = float((pct < 0).sum() / n)
-            strong = float((pct >= 3).sum() / n)
-            weak = float((pct <= -3).sum() / n)
-            approx_limit_down = int((pct <= -9.5).sum())
-            approx_limit_down_ratio = float(approx_limit_down / n)
+                adv = float((pct > 0).sum() / n)
+                dec = float((pct < 0).sum() / n)
+                strong = float((pct >= 3).sum() / n)
+                weak = float((pct <= -3).sum() / n)
+                approx_limit_down = int((pct <= -9.5).sum())
+                approx_limit_down_ratio = float(approx_limit_down / n)
 
-            total_amount = np.nan
-            if amount_col:
-                total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
+                total_amount = np.nan
+                if amount_col:
+                    total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
 
-            now = pd.Timestamp.now().normalize()
-            self.add("A_BREADTH", pd.Series([adv], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_DECLINERS", pd.Series([dec], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_STRONG3", pd.Series([strong], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_WEAK3", pd.Series([weak], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), "AKShare:stock_zh_a_spot_em")
-            if not math.isnan(total_amount):
-                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), "AKShare:stock_zh_a_spot_em")
+                now = pd.Timestamp.now().normalize()
+                self.add("A_BREADTH", pd.Series([adv], index=[now]), f"AKShare:{label}")
+                self.add("A_DECLINERS", pd.Series([dec], index=[now]), f"AKShare:{label}")
+                self.add("A_STRONG3", pd.Series([strong], index=[now]), f"AKShare:{label}")
+                self.add("A_WEAK3", pd.Series([weak], index=[now]), f"AKShare:{label}")
+                self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), f"AKShare:{label}")
+                self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), f"AKShare:{label}")
+                if not math.isnan(total_amount):
+                    self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), f"AKShare:{label}")
 
-            self._save_snapshot({
-                "date": now.strftime("%Y-%m-%d"),
-                "breadth": adv,
-                "decliners": dec,
-                "strong3": strong,
-                "weak3": weak,
-                "limit_down_approx": approx_limit_down,
-                "limit_down_ratio": approx_limit_down_ratio,
-                "turnover": None if math.isnan(total_amount) else total_amount,
-            })
+                self._save_snapshot({
+                    "date": now.strftime("%Y-%m-%d"),
+                    "breadth": adv,
+                    "decliners": dec,
+                    "strong3": strong,
+                    "weak3": weak,
+                    "limit_down_approx": approx_limit_down,
+                    "limit_down_ratio": approx_limit_down_ratio,
+                    "turnover": None if math.isnan(total_amount) else total_amount,
+                })
 
-            hist = self._load_snapshot_history()
-            if not hist.empty:
-                hist.index = pd.to_datetime(hist["date"])
-                if "breadth" in hist:
-                    self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history")
-                if "turnover" in hist:
-                    self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
-        except Exception as e:
-            self.warnings.append(f"A股横截面获取失败: {e}")
+                hist = self._load_snapshot_history()
+                if not hist.empty:
+                    hist.index = pd.to_datetime(hist["date"])
+                    if "breadth" in hist:
+                        self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history")
+                    if "turnover" in hist:
+                        self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
+
+                fetched = True
+                break
+            except Exception as e:
+                self.warnings.append(f"A股横截面获取失败 ({label}): {e}")
+
+        if not fetched:
+            self._load_stale_breadth_fallback()
+
+    def _load_stale_breadth_fallback(self) -> None:
+        """When live snapshot fails, load the most recent saved row as a labeled stale fallback."""
+        hist = self._load_snapshot_history()
+        if hist.empty:
+            self.warnings.append("A股横截面实时获取失败，且无本地历史快照可用作回退。")
+            return
+        hist = hist.copy()
+        hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+        hist = hist.dropna(subset=["date"]).sort_values("date")
+        if hist.empty:
+            return
+        last_row = hist.iloc[-1]
+        last_date = pd.Timestamp(last_row["date"])
+        days_old = (pd.Timestamp.now().normalize() - last_date.normalize()).days
+        stale_label = f"local snapshot history [STALE: {days_old}d old, 实时获取失败]"
+        self.warnings.append(
+            f"⚠ A股横截面实时获取失败，使用本地历史快照回退（最后日期={last_date.date()}, "
+            f"已过{days_old}天）。请谨慎参考市场宽度指标。"
+        )
+        idx = [last_date]
+        for col, key in [("breadth","A_BREADTH"),("decliners","A_DECLINERS"),
+                         ("strong3","A_STRONG3"),("weak3","A_WEAK3"),
+                         ("limit_down_ratio","A_LIMIT_DOWN_RATIO")]:
+            if col in last_row and pd.notna(last_row[col]):
+                self.add(key, pd.Series([float(last_row[col])], index=idx), stale_label)
+        if "limit_down_approx" in last_row and pd.notna(last_row["limit_down_approx"]):
+            self.add("A_LIMIT_DOWN_APPROX",
+                     pd.Series([float(last_row["limit_down_approx"])], index=idx), stale_label)
+        # Also reload the full history for ratio calculations
+        hist.index = hist["date"]
+        if "breadth" in hist.columns:
+            self.add("A_BREADTH_HIST", hist["breadth"].dropna(), "local snapshot history")
+        if "turnover" in hist.columns:
+            self.add("A_TURNOVER_HIST", hist["turnover"].dropna(), "local snapshot history")
 
     def fetch_margin(self) -> None:
         if ak is None:
@@ -1093,6 +1176,128 @@ def print_console(result: EngineResult) -> None:
         for w in result.warnings:
             print("  -", w)
 
+def _save_html_report(result: EngineResult, features: Dict[str, Optional[float]]) -> None:
+    """Generate a self-contained HTML dashboard report for Colab download / offline viewing."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    action_color = "#2ecc71" if "BUY" in result.action else ("#e74c3c" if "SELL" in result.action or "REDUCE" in result.action or "RISK_OFF" in result.action else "#f39c12")
+    buy_bar = f'<div style="width:{result.buy_score:.0f}%;background:#2ecc71;height:22px;display:inline-block;border-radius:4px"></div>'
+    sell_bar = f'<div style="width:{result.sell_score:.0f}%;background:#e74c3c;height:22px;display:inline-block;border-radius:4px"></div>'
+
+    factor_rows = ""
+    for x in result.factors:
+        sig_str = f"{x.signal:+.2f}" if x.signal is not None else "—"
+        val_str = f"{x.value:.4g}" if x.value is not None else "—"
+        miss = "⚠ 缺失" if x.missing else ""
+        factor_rows += (
+            f"<tr><td>{x.group}</td><td>{x.name}</td><td>{x.weight}</td>"
+            f"<td>{sig_str}</td><td>{val_str}</td><td>{miss}</td>"
+            f"<td style='font-size:11px;color:#555'>{x.detail[:80]}</td></tr>\n"
+        )
+
+    warn_rows = "".join(f"<li>{w}</li>" for w in result.warnings[:30])
+    path_rows = "".join(f"<li>{p}</li>" for p in result.decision_path)
+
+    # Run history chart (simple inline table)
+    history_path = OUTPUT_DIR / "run_history.csv"
+    history_html = ""
+    if history_path.exists():
+        try:
+            hist = pd.read_csv(history_path).tail(14)
+            history_html = "<h2>近期评分历史（最近14次）</h2><table border='1' cellpadding='4' style='border-collapse:collapse;font-size:12px'>"
+            history_html += "<tr><th>时间</th><th>买入分</th><th>卖出分</th><th>置信度</th><th>动作</th><th>风险等级</th></tr>"
+            for _, row in hist.iterrows():
+                history_html += (
+                    f"<tr><td>{row.get('timestamp','')}</td>"
+                    f"<td style='color:#2ecc71'>{row.get('buy_score','')}</td>"
+                    f"<td style='color:#e74c3c'>{row.get('sell_score','')}</td>"
+                    f"<td>{row.get('confidence','')}</td>"
+                    f"<td>{row.get('action','')}</td>"
+                    f"<td>{row.get('risk_level','')}</td></tr>\n"
+                )
+            history_html += "</table>"
+        except Exception:
+            pass
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>A股风险评分报告</title>
+<style>
+  body{{font-family:Arial,sans-serif;margin:24px;background:#f5f5f5;color:#222}}
+  .card{{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
+  .score-label{{font-size:14px;color:#888;margin-bottom:4px}}
+  .score-value{{font-size:32px;font-weight:bold}}
+  .action-badge{{display:inline-block;padding:8px 20px;border-radius:20px;color:#fff;font-size:18px;font-weight:bold;background:{action_color}}}
+  table{{border-collapse:collapse;width:100%;font-size:13px}}
+  th{{background:#e0e0e0;padding:6px 8px;text-align:left}}
+  td{{padding:5px 8px;border-bottom:1px solid #eee}}
+  ul{{margin:0;padding-left:20px}}
+  h2{{margin-top:0;font-size:16px;color:#333}}
+  .bar-container{{background:#eee;border-radius:4px;margin:4px 0}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 style="margin:0 0 8px">A股多因子外部风险评分</h1>
+  <div style="color:#888;font-size:13px">生成时间: {result.timestamp}</div>
+</div>
+
+<div class="card" style="display:flex;gap:32px;flex-wrap:wrap">
+  <div>
+    <div class="score-label">买入分 (偏多)</div>
+    <div class="score-value" style="color:#2ecc71">{result.buy_score}</div>
+    <div class="bar-container">{buy_bar}</div>
+  </div>
+  <div>
+    <div class="score-label">卖出分 (偏空)</div>
+    <div class="score-value" style="color:#e74c3c">{result.sell_score}</div>
+    <div class="bar-container">{sell_bar}</div>
+  </div>
+  <div>
+    <div class="score-label">风险等级</div>
+    <div class="score-value" style="font-size:24px">{result.risk_level}</div>
+  </div>
+  <div>
+    <div class="score-label">数据置信度</div>
+    <div class="score-value" style="font-size:24px">{result.confidence}%</div>
+  </div>
+  <div>
+    <div class="score-label">共振调整</div>
+    <div class="score-value" style="font-size:24px">{result.resonance_adjustment:+.1f}</div>
+  </div>
+  <div>
+    <div class="score-label">最终动作建议</div>
+    <div style="margin-top:6px"><span class="action-badge">{result.action}</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>决策路径</h2>
+  <ul>{path_rows}</ul>
+</div>
+
+<div class="card">
+  <h2>因子明细</h2>
+  <table>
+    <tr><th>组别</th><th>因子</th><th>权重</th><th>信号(-1多/+1空)</th><th>数值</th><th>状态</th><th>说明</th></tr>
+    {factor_rows}
+  </table>
+</div>
+
+{history_html}
+
+<div class="card">
+  <h2>数据提醒 / 警告</h2>
+  <ul>{warn_rows}</ul>
+</div>
+
+</body>
+</html>"""
+    report_path = OUTPUT_DIR / "dashboard_report.html"
+    report_path.write_text(html, encoding="utf-8")
+
 def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     obj = asdict(result)
@@ -1107,6 +1312,31 @@ def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> 
         OUTPUT_DIR / "feature_snapshot.csv", index=False, encoding="utf-8-sig"
     )
     save_decision_tree()
+    # Append to run history (last 30 days kept)
+    history_path = OUTPUT_DIR / "run_history.csv"
+    new_row = pd.DataFrame([{
+        "timestamp": result.timestamp,
+        "buy_score": result.buy_score,
+        "sell_score": result.sell_score,
+        "confidence": result.confidence,
+        "action": result.action,
+        "risk_level": result.risk_level,
+        "resonance_adjustment": result.resonance_adjustment,
+        "missing_critical": "|".join(result.missing_critical),
+    }])
+    if history_path.exists():
+        try:
+            old = pd.read_csv(history_path)
+            combined = pd.concat([old, new_row], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
+            combined = combined.tail(30)
+        except Exception:
+            combined = new_row
+    else:
+        combined = new_row
+    combined.to_csv(history_path, index=False, encoding="utf-8-sig")
+    # Generate self-contained HTML report (Colab-friendly download)
+    _save_html_report(result, features)
 
 def calibration_notes() -> str:
     return """

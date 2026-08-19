@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>A股风险评分报告</title>
+<style>
+  body{font-family:Arial,sans-serif;margin:24px;background:#f5f5f5;color:#222}
+  .card{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.1)}
+  .score-label{font-size:14px;color:#888;margin-bottom:4px}
+  .score-value{font-size:32px;font-weight:bold}
+  .action-badge{display:inline-block;padding:8px 20px;border-radius:20px;color:#fff;font-size:18px;font-weight:bold;background:#f39c12}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th{background:#e0e0e0;padding:6px 8px;text-align:left}
+  td{padding:5px 8px;border-bottom:1px solid #eee}
+  ul{margin:0;padding-left:20px}
+  h2{margin-top:0;font-size:16px;color:#333}
+  .bar-container{background:#eee;border-radius:4px;margin:4px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 style="margin:0 0 8px">A股多因子外部风险评分</h1>
+  <div style="color:#888;font-size:13px">生成时间: 2026-08-19T11:15:35+00:00</div>
+</div>
+
+<div class="card" style="display:flex;gap:32px;flex-wrap:wrap">
+  <div>
+    <div class="score-label">买入分 (偏多)</div>
+    <div class="score-value" style="color:#2ecc71">50.0</div>
+    <div class="bar-container"><div style="width:50%;background:#2ecc71;height:22px;display:inline-block;border-radius:4px"></div></div>
+  </div>
+  <div>
+    <div class="score-label">卖出分 (偏空)</div>
+    <div class="score-value" style="color:#e74c3c">50.0</div>
+    <div class="bar-container"><div style="width:50%;background:#e74c3c;height:22px;display:inline-block;border-radius:4px"></div></div>
+  </div>
+  <div>
+    <div class="score-label">风险等级</div>
+    <div class="score-value" style="font-size:24px">中性</div>
+  </div>
+  <div>
+    <div class="score-label">数据置信度</div>
+    <div class="score-value" style="font-size:24px">0.0%</div>
+  </div>
+  <div>
+    <div class="score-label">共振调整</div>
+    <div class="score-value" style="font-size:24px">+0.0</div>
+  </div>
+  <div>
+    <div class="score-label">最终动作建议</div>
+    <div style="margin-top:6px"><span class="action-badge">DATA_INCOMPLETE / 不根据信号交易</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>决策路径</h2>
+  <ul><li>数据置信度=0.0，或关键数据缺失过多 -> DATA_INCOMPLETE</li></ul>
+</div>
+
+<div class="card">
+  <h2>因子明细</h2>
+  <table>
+    <tr><th>组别</th><th>因子</th><th>权重</th><th>信号(-1多/+1空)</th><th>数值</th><th>状态</th><th>说明</th></tr>
+    <tr><td>全球利率</td><td>美债10Y绝对水平</td><td>5.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>缺失</td></tr>
+<tr><td>全球利率</td><td>美债10Y斜率/变化速度</td><td>8.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日=Nonebp, 20日=Nonebp；快速上行权重高于绝对值</td></tr>
+<tr><td>全球利率</td><td>美债10Y实际利率</td><td>8.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>缺失</td></tr>
+<tr><td>全球利率</td><td>美债2Y/Fed预期重定价</td><td>5.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>2Y: 5日=Nonebp, 20日=Nonebp</td></tr>
+<tr><td>央行政策</td><td>美联储政策利率方向</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>Fed Funds=None%, 20日变化=Nonebp；低权重</td></tr>
+<tr><td>央行政策</td><td>日本央行政策利率方向</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>BOJ=None%, 20日变化=Nonebp</td></tr>
+<tr><td>全球信用</td><td>美国高收益债OAS</td><td>4.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>HY OAS=None%, 5日变化=Nonebp</td></tr>
+<tr><td>汇率</td><td>离岸人民币USD/CNH</td><td>8.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>现值=None, 5日=None%, 20日=None%；上涨=人民币走弱</td></tr>
+<tr><td>汇率</td><td>美元指数DXY</td><td>4.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>DXY=None, 5日=None%, 20日=None%</td></tr>
+<tr><td>汇率</td><td>中美10Y国债利差</td><td>3.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>CN-US=Nonebp, 20日变化=Nonebp</td></tr>
+<tr><td>全球风险</td><td>VIX恐慌指数</td><td>7.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>VIX=None, 5日=None%</td></tr>
+<tr><td>中国资产外盘</td><td>恒生科技</td><td>6.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>中国资产外盘</td><td>恒生指数</td><td>3.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>中国资产外盘</td><td>富时中国A50</td><td>4.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>全球科技</td><td>纳斯达克100</td><td>3.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>全球科技</td><td>费城半导体SOX</td><td>4.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>亚洲风险</td><td>日经225</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>亚洲/半导体周期</td><td>韩国KOSPI</td><td>1.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>1日=None%, 5日=None%, 20日=None%；看变化速度</td></tr>
+<tr><td>亚洲流动性</td><td>日元套息平仓风险</td><td>3.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>USDJPY 1日=None%, 5日=None%；负值越大=日元升值越快</td></tr>
+<tr><td>商品/增长</td><td>铜价趋势</td><td>1.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>铜20日=None%；大跌偏风险，大涨只给有限利多</td></tr>
+<tr><td>商品/通胀</td><td>原油趋势</td><td>1.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>原油20日=None%；暴涨=通胀风险，暴跌=需求/信用风险</td></tr>
+<tr><td>商品/中国需求</td><td>铁矿石趋势</td><td>1.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>铁矿20日=None%；仅作为中国周期温度计</td></tr>
+<tr><td>A股内部</td><td>沪深300自身趋势</td><td>5.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日=None%, 20日=None%；确认外部冲击是否传入</td></tr>
+<tr><td>A股内部</td><td>创业板趋势</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日=None%, 20日=None%</td></tr>
+<tr><td>A股内部</td><td>科创50趋势</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日=None%, 20日=None%</td></tr>
+<tr><td>A股内部</td><td>中证1000趋势</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日=None%, 20日=None%</td></tr>
+<tr><td>A股内部</td><td>A股上涨家数比例</td><td>5.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>上涨比例=None%；<30%偏空，>60%偏多</td></tr>
+<tr><td>A股内部</td><td>A股强弱扩散差</td><td>2.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>跌幅>=3%占比 - 涨幅>=3%占比 = None；正值越大说明弱股扩散</td></tr>
+<tr><td>A股内部</td><td>A股近似跌停比例</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>近似跌停股占全部A股=None%；使用比例而非固定家数</td></tr>
+<tr><td>A股成交结构</td><td>沪深300成交额确认</td><td>1.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>成交额/MA20=None, 指数5日=None%；放量只用于确认方向</td></tr>
+<tr><td>A股成交结构</td><td>中证1000成交额确认</td><td>1.2</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>成交额/MA20=None, 指数5日=None%；放量只用于确认方向</td></tr>
+<tr><td>A股成交结构</td><td>创业板成交额确认</td><td>1.2</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>成交额/MA20=None, 指数5日=None%；放量只用于确认方向</td></tr>
+<tr><td>A股成交结构</td><td>科创50成交额确认</td><td>1.2</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>成交额/MA20=None, 指数5日=None%；放量只用于确认方向</td></tr>
+<tr><td>A股内部</td><td>A股成交额/MA20</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>成交额比=None；量本身无方向，主要用于共振规则</td></tr>
+<tr><td>A股内部</td><td>融资余额变化</td><td>2.5</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日=None%, 20日=None%；持续下降偏风险</td></tr>
+<tr><td>A股资金</td><td>主要宽基ETF 5日净流入</td><td>2.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>5日净流入=None亿元；正值偏多</td></tr>
+<tr><td>A股衍生品</td><td>IF基差</td><td>1.0</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>IF_BASIS_PCT=None%；负值贴水偏风险</td></tr>
+<tr><td>A股衍生品</td><td>IC基差</td><td>0.8</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>IC_BASIS_PCT=None%；负值贴水偏风险</td></tr>
+<tr><td>A股衍生品</td><td>IM基差</td><td>0.8</td><td>—</td><td>—</td><td>⚠ 缺失</td><td style='font-size:11px;color:#555'>IM_BASIS_PCT=None%；负值贴水偏风险</td></tr>
+
+  </table>
+</div>
+
+<h2>近期评分历史（最近14次）</h2><table border='1' cellpadding='4' style='border-collapse:collapse;font-size:12px'><tr><th>时间</th><th>买入分</th><th>卖出分</th><th>置信度</th><th>动作</th><th>风险等级</th></tr><tr><td>2026-08-19T11:15:35+00:00</td><td style='color:#2ecc71'>50.0</td><td style='color:#e74c3c'>50.0</td><td>0.0</td><td>DATA_INCOMPLETE / 不根据信号交易</td><td>中性</td></tr>
+</table>
+
+<div class="card">
+  <h2>数据提醒 / 警告</h2>
+  <ul><li>关键数据缺失: A_BREADTH, CSI300, HSTECH, US10Y, US10Y_REAL, USDCNH, VIX</li></ul>
+</div>
+
+</body>
+</html>

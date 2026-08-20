@@ -20,9 +20,11 @@ A股多因子外部风险评分引擎
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -46,6 +48,15 @@ DEFAULT_HISTORY_DAYS = 220
 STATE_DIR = Path("state")
 OUTPUT_DIR = Path("output")
 MANUAL_FILE = Path("manual_overrides.json")
+
+# FRED public CSV endpoint (no API key required; ~1 year of daily data)
+FRED_PUBLIC_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+
+# Cache file for last-known-good A-share index history (price + amount)
+INDEX_CACHE_FILE = STATE_DIR / "index_history_cache.csv"
+
+# Cache file for last-known-good ETF flow / futures basis values
+DERIVED_CACHE_FILE = STATE_DIR / "derived_cache.json"
 
 YF_TICKERS = {
     "SSE": "000001.SS",
@@ -150,6 +161,20 @@ class EngineResult:
 
 def clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return float(max(lo, min(hi, x)))
+
+def _http_get_with_retry(url: str, params: Optional[dict] = None,
+                         timeout: int = 20, retries: int = 3,
+                         backoff: float = 2.0) -> Optional[requests.Response]:
+    """GET with simple exponential-backoff retry for transient errors."""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(backoff ** attempt)
+    return None
 
 def latest(s: Optional[pd.Series]) -> Optional[float]:
     if s is None or len(s.dropna()) == 0:
@@ -364,41 +389,133 @@ class DataHub:
 
     def fetch_fred(self) -> None:
         api_key = os.getenv("FRED_API_KEY", "").strip()
-        if not api_key:
-            self.warnings.append(
-                "未设置 FRED_API_KEY：US10Y_REAL、HY_OAS 等官方宏观序列可能缺失；"
-                "程序会降低置信度，而不是假装数据存在。"
-            )
-            return
-
         start = (datetime.now().date() - timedelta(days=self.history_days * 2)).isoformat()
-        url = "https://api.stlouisfed.org/fred/series/observations"
-        for key, sid in FRED_SERIES.items():
-            try:
-                r = requests.get(
-                    url,
-                    params={
-                        "series_id": sid,
-                        "api_key": api_key,
-                        "file_type": "json",
-                        "observation_start": start,
-                        "sort_order": "asc",
-                    },
-                    timeout=20,
-                )
-                r.raise_for_status()
-                obs = r.json().get("observations", [])
-                rows = [(x["date"], float(x["value"])) for x in obs if x.get("value") not in (None, ".")]
-                if rows:
-                    self.add(
-                        key,
-                        pd.Series([v for _, v in rows], index=pd.to_datetime([d for d, _ in rows])),
-                        f"FRED:{sid}"
+
+        if api_key:
+            url = "https://api.stlouisfed.org/fred/series/observations"
+            for key, sid in FRED_SERIES.items():
+                try:
+                    r = _http_get_with_retry(
+                        url,
+                        params={
+                            "series_id": sid,
+                            "api_key": api_key,
+                            "file_type": "json",
+                            "observation_start": start,
+                            "sort_order": "asc",
+                        },
+                        timeout=20,
                     )
-                else:
-                    self.warnings.append(f"FRED 无有效数据: {sid}")
-            except Exception as e:
-                self.warnings.append(f"FRED 获取失败 {sid}: {e}")
+                    if r is None:
+                        raise RuntimeError("请求超时/失败")
+                    obs = r.json().get("observations", [])
+                    rows = [(x["date"], float(x["value"])) for x in obs if x.get("value") not in (None, ".")]
+                    if rows:
+                        self.add(
+                            key,
+                            pd.Series([v for _, v in rows], index=pd.to_datetime([d for d, _ in rows])),
+                            f"FRED:{sid}"
+                        )
+                        self._save_fred_cache(key, self.series[key].values)
+                    else:
+                        self.warnings.append(f"FRED 无有效数据: {sid}")
+                        self._try_fred_public_csv(key, sid, start)
+                except Exception as e:
+                    self.warnings.append(f"FRED 获取失败 {sid}: {e}")
+                    self._try_fred_public_csv(key, sid, start)
+        else:
+            self.warnings.append(
+                "未设置 FRED_API_KEY：尝试 FRED 公共 CSV 端点（免密钥，约1年历史）作为降级回退。"
+            )
+            for key, sid in FRED_SERIES.items():
+                self._try_fred_public_csv(key, sid, start)
+
+    def _try_fred_public_csv(self, key: str, sid: str, start: str) -> None:
+        """
+        Fallback: fetch FRED series via public CSV download (no API key).
+        Source is labelled explicitly as 'FRED-public-csv' so callers know it
+        is not the official authenticated endpoint.
+        """
+        if key in self.series:
+            return  # already populated by API path
+        try:
+            r = _http_get_with_retry(
+                FRED_PUBLIC_CSV_URL,
+                params={"id": sid},
+                timeout=25,
+            )
+            if r is None:
+                raise RuntimeError("public CSV 请求失败")
+            df = pd.read_csv(io.StringIO(r.text))
+            # Typical columns: DATE, <SID>
+            date_col = next((c for c in df.columns if "date" in c.lower()), None)
+            val_col = next((c for c in df.columns if c.upper() == sid.upper()), None)
+            if val_col is None and len(df.columns) >= 2:
+                val_col = df.columns[1]
+            if date_col and val_col:
+                idx = pd.to_datetime(df[date_col], errors="coerce")
+                vals = pd.to_numeric(df[val_col].replace(".", np.nan), errors="coerce")
+                s = pd.Series(vals.values, index=idx).dropna()
+                s = s[s.index >= pd.to_datetime(start)]
+                if len(s) > 0:
+                    self.add(key, s, f"FRED-public-csv:{sid} (免密钥降级，约1年历史)")
+                    self.warnings.append(
+                        f"⚠ {key} 使用 FRED 公共 CSV（免密钥）：历史深度约1年，非实时。"
+                    )
+                    self._save_fred_cache(key, s)
+                    return
+        except Exception as e:
+            self.warnings.append(f"FRED public CSV fallback 失败 {sid}: {e}")
+        # Last resort: load from local cache
+        self._load_fred_cache(key, sid)
+
+    def _fred_cache_path(self) -> Path:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        return STATE_DIR / "fred_cache.csv"
+
+    def _save_fred_cache(self, key: str, s: pd.Series) -> None:
+        """Append/update a FRED series into the local cache CSV."""
+        try:
+            path = self._fred_cache_path()
+            new_df = s.reset_index()
+            new_df.columns = ["date", "value"]
+            new_df["key"] = key
+            if path.exists():
+                existing = pd.read_csv(path)
+                combined = pd.concat([existing, new_df], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["key", "date"], keep="last")
+            else:
+                combined = new_df
+            combined.to_csv(path, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass  # cache save failure is non-fatal
+
+    def _load_fred_cache(self, key: str, sid: str) -> None:
+        """Load a FRED series from local cache as a stale/cached fallback."""
+        if key in self.series:
+            return
+        try:
+            path = self._fred_cache_path()
+            if not path.exists():
+                self.warnings.append(f"{key}({sid}): 无 FRED 缓存可用，数据缺失。")
+                return
+            df = pd.read_csv(path)
+            sub = df[df["key"] == key].copy()
+            if sub.empty:
+                self.warnings.append(f"{key}({sid}): 无 FRED 缓存可用，数据缺失。")
+                return
+            sub["date"] = pd.to_datetime(sub["date"], errors="coerce")
+            sub = sub.dropna(subset=["date"]).sort_values("date")
+            last_date = sub["date"].iloc[-1]
+            age = (pd.Timestamp.now().normalize() - pd.Timestamp(last_date).normalize()).days
+            s = pd.Series(pd.to_numeric(sub["value"], errors="coerce").values, index=sub["date"]).dropna()
+            if len(s) > 0:
+                self.add(key, s, f"FRED-local-cache:{sid} (缓存日期={last_date.date()}, 已滞后{age}天)")
+                self.warnings.append(
+                    f"⚠ {key} 使用本地 FRED 缓存（日期={last_date.date()}, 已滞后{age}天），非实时。"
+                )
+        except Exception as e:
+            self.warnings.append(f"FRED 本地缓存加载失败 {key}: {e}")
 
     def fetch_ak_bond_yields(self) -> None:
         if ak is None:
@@ -427,10 +544,36 @@ class DataHub:
 
     def fetch_a_index_history(self) -> None:
         """用 AKShare 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。"""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         if ak is None:
+            self.warnings.append("未安装 AKShare：A股指数成交额历史将尝试 yfinance 价格代替。")
+            self._fetch_a_index_yfinance_fallback()
+            self._load_index_history_cache()
             return
         for key, symbol in AK_INDEX_SYMBOLS.items():
             self._fetch_single_a_index(key, symbol)
+        # After AKShare fetches, persist what we got and fill any gaps from cache
+        self._save_index_history_cache()
+        self._load_index_history_cache()  # fills any still-missing series from cache
+
+    def _fetch_a_index_yfinance_fallback(self) -> None:
+        """Use yfinance to fetch price history for A-share indices when AKShare is unavailable."""
+        if yf is None:
+            return
+        end = datetime.now().date() + timedelta(days=1)
+        start = end - timedelta(days=self.history_days * 2)
+        for key in AK_INDEX_SYMBOLS:
+            if key in self.series:
+                continue
+            ticker = YF_TICKERS.get(key)
+            if not ticker:
+                continue
+            s = self._yf_close(ticker, start.isoformat(), end.isoformat())
+            if s is not None:
+                self.add(key, s, f"yfinance:{ticker} (A股指数价格代理，无成交额)")
+                self.warnings.append(
+                    f"⚠ {key} 指数历史使用 yfinance ({ticker}) 价格代理，成交额/量不可用。"
+                )
 
     def _fetch_single_a_index(self, key: str, symbol: str) -> None:
         """Fetch one A-share index with fallback ladder."""
@@ -458,7 +601,21 @@ class DataHub:
             except Exception as e:
                 self.warnings.append(f"A股指数历史 index_zh_a_hist fallback 失败 {key}: {e}")
 
-        # Attempt 3: existing local cached close (no amount data but at least price)
+        # Attempt 3: yfinance price history (no amount data but at least price)
+        if df is None or df.empty:
+            ticker = YF_TICKERS.get(key)
+            if ticker and yf is not None:
+                end = datetime.now().date() + timedelta(days=1)
+                start = end - timedelta(days=self.history_days * 2)
+                s = self._yf_close(ticker, start.isoformat(), end.isoformat())
+                if s is not None and key not in self.series:
+                    self.add(key, s, f"yfinance:{ticker} (A股指数价格代理，AKShare失败，无成交额)")
+                    self.warnings.append(
+                        f"⚠ {key} AKShare失败，降级为 yfinance ({ticker}) 价格代理，成交额/量不可用。"
+                    )
+                return  # yfinance path: no df to extract amount from
+
+        # Attempt 4: existing local cached close (no amount data but at least price)
         if (df is None or df.empty) and key in self.series:
             self.warnings.append(f"A股指数历史 {key}({symbol}): 使用已有缓存数据，成交额不可用。")
             return
@@ -487,6 +644,58 @@ class DataHub:
             self.add(key+"_INDEX_VOLUME",
                      pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
                      source_used)
+
+    def _save_index_history_cache(self) -> None:
+        """Persist current A-share index price + amount series to local cache CSV."""
+        try:
+            rows = []
+            for key in list(AK_INDEX_SYMBOLS.keys()):
+                for suffix in ["", "_INDEX_AMOUNT", "_INDEX_VOLUME"]:
+                    k = key + suffix
+                    s = self.get(k)
+                    if s is not None and len(s) > 0:
+                        tmp = s.reset_index()
+                        tmp.columns = ["date", "value"]
+                        tmp["key"] = k
+                        rows.append(tmp)
+            if not rows:
+                return
+            new_df = pd.concat(rows, ignore_index=True)
+            if INDEX_CACHE_FILE.exists():
+                existing = pd.read_csv(INDEX_CACHE_FILE)
+                combined = pd.concat([existing, new_df], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["key", "date"], keep="last")
+            else:
+                combined = new_df
+            combined.to_csv(INDEX_CACHE_FILE, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass  # non-fatal
+
+    def _load_index_history_cache(self) -> None:
+        """Load cached A-share index history for any series still missing after live fetches."""
+        if not INDEX_CACHE_FILE.exists():
+            return
+        try:
+            df = pd.read_csv(INDEX_CACHE_FILE)
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            for key in df["key"].unique():
+                if key in self.series:
+                    continue  # live data already present
+                sub = df[df["key"] == key].sort_values("date")
+                s = pd.Series(pd.to_numeric(sub["value"], errors="coerce").values,
+                              index=sub["date"]).dropna()
+                if len(s) == 0:
+                    continue
+                last_date = s.index[-1]
+                age = (pd.Timestamp.now().normalize() - last_date.normalize()).days
+                self.add(key, s,
+                         f"local-index-cache (缓存日期={last_date.date()}, 已滞后{age}天)")
+                self.warnings.append(
+                    f"⚠ {key} 使用本地指数历史缓存（日期={last_date.date()}, 已滞后{age}天）。"
+                )
+        except Exception as e:
+            self.warnings.append(f"A股指数历史缓存加载失败: {e}")
 
     def fetch_a_share_snapshot(self) -> None:
         if ak is None:
@@ -670,6 +879,76 @@ class DataHub:
                          "AKShare:macro_bank_japan_interest_rate")
         except Exception as e:
             self.warnings.append(f"日本央行利率获取失败: {e}")
+
+    def load_derived_cache(self) -> None:
+        """
+        Load last-known-good values for derived/manual fields (ETF_FLOW_5D_BN,
+        IF/IC/IM basis) from the local derived cache JSON.  Only fills fields
+        that are still missing after live fetches and manual overrides.
+        Source is labelled explicitly as 'derived-cache' so downstream code
+        knows the value is potentially stale.
+        """
+        DERIVED_KEYS = ["ETF_FLOW_5D_BN", "IF_BASIS_PCT", "IC_BASIS_PCT", "IM_BASIS_PCT"]
+        if not DERIVED_CACHE_FILE.exists():
+            return
+        try:
+            data = json.loads(DERIVED_CACHE_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            self.warnings.append(f"derived_cache.json 解析失败: {e}")
+            return
+        for key in DERIVED_KEYS:
+            if key in self.series:
+                continue  # live / manual value already present
+            entry = data.get(key)
+            if entry is None:
+                continue
+            try:
+                value = float(entry["value"])
+                date = pd.to_datetime(entry.get("date", pd.Timestamp.now()))
+                age = (pd.Timestamp.now().normalize() - pd.Timestamp(date).normalize()).days
+                source = f"derived-cache (日期={date.date() if hasattr(date,'date') else date}, 已滞后{age}天)"
+                self.add(key, pd.Series([value], index=[pd.Timestamp(date)]), source)
+                self.warnings.append(
+                    f"⚠ {key} 使用本地 derived 缓存值={value}（日期={date.date() if hasattr(date,'date') else date}, "
+                    f"已滞后{age}天），非实时。"
+                )
+            except Exception as e:
+                self.warnings.append(f"derived_cache {key} 读取失败: {e}")
+
+    def save_derived_cache(self) -> None:
+        """
+        Persist current values of ETF_FLOW_5D_BN / IF/IC/IM basis to
+        DERIVED_CACHE_FILE so future runs can use them as last-known-good
+        fallbacks.  Only saves entries whose source is NOT already a cache.
+        """
+        DERIVED_KEYS = ["ETF_FLOW_5D_BN", "IF_BASIS_PCT", "IC_BASIS_PCT", "IM_BASIS_PCT"]
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        existing: dict = {}
+        if DERIVED_CACHE_FILE.exists():
+            try:
+                existing = json.loads(DERIVED_CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        for key in DERIVED_KEYS:
+            ds = self.series.get(key)
+            if ds is None:
+                continue
+            # Don't overwrite with a cache value (avoid stale-on-stale propagation)
+            if "cache" in ds.source.lower():
+                continue
+            v = latest(ds.values)
+            if v is None:
+                continue
+            last_date = ds.last_date
+            date_str = (last_date.date().isoformat()
+                        if last_date is not None and hasattr(last_date, "date")
+                        else pd.Timestamp.now().date().isoformat())
+            existing[key] = {"value": v, "date": date_str}
+        try:
+            DERIVED_CACHE_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2),
+                                          encoding="utf-8")
+        except Exception as e:
+            self.warnings.append(f"derived_cache 保存失败: {e}")
 
     def load_manual_overrides(self, path: Path = MANUAL_FILE) -> None:
         if not path.exists():
@@ -1338,6 +1617,8 @@ def run(history_days: int = DEFAULT_HISTORY_DAYS, no_live: bool = False) -> Engi
         hub.fetch_margin()
         hub.fetch_boj_policy()
     hub.load_manual_overrides()
+    # Load last-known-good derived values (ETF flow, futures basis) as fallback
+    hub.load_derived_cache()
 
     fe = FactorEngine(hub)
     features = fe.build_features()
@@ -1345,6 +1626,8 @@ def run(history_days: int = DEFAULT_HISTORY_DAYS, no_live: bool = False) -> Engi
     result = score_engine(factors, features, hub)
     print_console(result)
     save_outputs(result, features)
+    # Persist any live derived values for future runs
+    hub.save_derived_cache()
     return result
 
 def build_manual_template() -> None:

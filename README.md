@@ -43,6 +43,9 @@ python a_share_risk_engine.py
 - `output/decision_tree.dot`
 - `output/decision_tree.png`（Graphviz可用时）
 - `state/a_market_snapshot.csv`
+- `state/fred_cache.csv`（FRED 本地缓存，每次成功获取后自动更新）
+- `state/index_history_cache.csv`（A股指数历史本地缓存，每次成功获取后自动更新）
+- `state/derived_cache.json`（ETF流量/基差本地缓存，每次成功填充后自动更新）
 
 ## 仪表板
 
@@ -119,9 +122,12 @@ print("Dashboard URL:", ngrok.connect(8501))
 
 ### A股指数历史
 依次尝试：
-1. `ak.stock_zh_index_daily_em(symbol=...)`
-2. `ak.index_zh_a_hist(symbol=..., period="daily")`（更新版 AKShare 路径）
-3. 使用已有内存缓存数据（不含成交额）
+1. `ak.stock_zh_index_daily_em(symbol=...)` （含成交额/量）
+2. `ak.index_zh_a_hist(symbol=..., period="daily")` （更新版 AKShare 路径）
+3. **yfinance** 价格代理（`source` 标注 `yfinance:... (A股指数价格代理，无成交额)`）
+4. **本地指数历史缓存** `state/index_history_cache.csv`（上次成功获取的历史，`source` 标注 `local-index-cache (缓存日期=..., 已滞后Xd)`）
+
+每次成功获取后自动更新本地缓存，确保 AKShare 临时失联时仍有历史数据用于 MA20 计算。
 
 ### A股横截面快照（市场宽度）
 依次尝试：
@@ -132,9 +138,26 @@ print("Dashboard URL:", ngrok.connect(8501))
 **重要：** 使用过期快照时，`source` 字段会注明 `stale snapshot (date=..., age=Xd)`，不会静默当作实时数据。
 
 ### 宏观数据（FRED）
-官方宏观数据（如 DFII10 实际利率）如未配置 API Key 则保持缺失，不会补假数据，仅降低置信度。
+降级梯队：
+1. **FRED 官方 API**（`FRED_API_KEY` 环境变量已设置时使用，返回完整历史）
+2. **FRED 公共 CSV 端点**（免密钥，约1年历史，`source` 标注 `FRED-public-csv`）
+3. **本地 FRED 缓存** `state/fred_cache.csv`（上次成功获取的数据，`source` 标注 `FRED-local-cache (date=..., 已滞后Xd)`）
+4. 三层均失败时数据缺失，置信度降低
 
-## 评分逻辑
+每次成功获取后会自动更新本地缓存，确保下次离线运行也有参考值。
+
+**配置方式（仍推荐设置 API Key 以获取最完整历史）：**
+
+### ETF 净流入 / 股指期货基差（ETF_FLOW_5D_BN / IF/IC/IM_BASIS_PCT）
+
+这些字段没有可靠的免费公开实时数据源。降级梯队：
+1. **手工覆盖** `manual_overrides.json`（`source` 标注 `manual`）
+2. **本地 derived 缓存** `state/derived_cache.json`（上次手工或成功填充的值，`source` 标注 `derived-cache (日期=..., 已滞后Xd)`）
+3. 两层均失败时该字段缺失（低权重，不影响核心信号）
+
+**使用方式：** 运行 `python a_share_risk_engine.py --make-manual-template`，填写 `manual_overrides.json` 后再运行引擎；值会自动写入 derived 缓存供后续运行使用。
+
+
 
 每个因子映射为：
 - -1：偏多

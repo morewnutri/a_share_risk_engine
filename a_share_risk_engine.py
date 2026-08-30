@@ -20,13 +20,16 @@ A股多因子外部风险评分引擎
 from __future__ import annotations
 
 import argparse
+from io import StringIO
 import json
 import math
 import os
+import sys
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable, Set
 
 import numpy as np
 import pandas as pd
@@ -42,31 +45,38 @@ try:
 except Exception:
     ak = None
 
+try:
+    import baostock as bs
+except Exception:
+    bs = None
+
 DEFAULT_HISTORY_DAYS = 220
+MACD_HISTORY_DAYS = 3650
 STATE_DIR = Path("state")
 OUTPUT_DIR = Path("output")
+CACHE_DIR = STATE_DIR / "series_cache"
 MANUAL_FILE = Path("manual_overrides.json")
 
-YF_TICKERS = {
-    "SSE": "000001.SS",
-    "CSI300": "000300.SS",
-    "CSI1000": "000852.SS",
-    "CHINEXT": "399006.SZ",
-    "STAR50": "000688.SS",
-    "HSI": "^HSI",
-    "HSTECH": "^HSTECH",
-    "A50": "XIN9.SI",
-    "VIX": "^VIX",
-    "NASDAQ100": "^NDX",
-    "SOX": "^SOX",
-    "DXY": "DX-Y.NYB",
-    "NIKKEI": "^N225",
-    "KOSPI": "^KS11",
-    "USDCNH": "CNH=X",
-    "USDJPY": "JPY=X",
-    "COPPER": "HG=F",
-    "OIL": "CL=F",
-    "IRON_ORE": "TIO=F",
+YF_TICKER_CANDIDATES = {
+    "SSE": ["000001.SS"],
+    "CSI300": ["000300.SS"],
+    "CSI1000": ["000852.SS"],
+    "CHINEXT": ["399006.SZ"],
+    "STAR50": ["000688.SS"],
+    "HSI": ["^HSI"],
+    "HSTECH": ["^HSTECH", "3033.HK", "3067.HK"],
+    "A50": ["XIN9.SI", "2823.HK"],
+    "VIX": ["^VIX"],
+    "NASDAQ100": ["^NDX"],
+    "SOX": ["^SOX"],
+    "DXY": ["DX-Y.NYB"],
+    "NIKKEI": ["^N225"],
+    "KOSPI": ["^KS11"],
+    "USDCNH": ["CNH=X"],
+    "USDJPY": ["JPY=X"],
+    "COPPER": ["HG=F"],
+    "OIL": ["CL=F"],
+    "IRON_ORE": ["TIO=F"],
 }
 
 AK_INDEX_SYMBOLS = {
@@ -75,6 +85,14 @@ AK_INDEX_SYMBOLS = {
     "CSI1000": "sh000852",
     "CHINEXT": "sz399006",
     "STAR50": "sh000688",
+}
+
+BAOSTOCK_INDEX_SYMBOLS = {
+    "SSE": "sh.000001",
+    "CSI300": "sh.000300",
+    "CSI1000": "sh.000852",
+    "CHINEXT": "sz.399006",
+    "STAR50": "sh.000688",
 }
 
 FRED_SERIES = {
@@ -98,6 +116,27 @@ MAX_AGE_DAYS = {
     "manual": 7,
 }
 
+NETWORK_RETRIES = 3
+NETWORK_BACKOFF_SEC = 1.0
+DEFAULT_REQUEST_TIMEOUT = (5, 20)
+
+INDEX_NAMES = {
+    "SSE": "上证指数",
+    "CSI300": "沪深300",
+    "CSI1000": "中证1000",
+    "CHINEXT": "创业板指",
+    "STAR50": "科创50",
+}
+
+AK_INDEX_FALLBACK_SYMBOLS = {
+    "SSE": "000001",
+    "CSI300": "000300",
+    "CSI1000": "000852",
+    "CHINEXT": "399006",
+    "STAR50": "000688",
+}
+MACD_INDEX_KEYS = tuple(INDEX_NAMES)
+
 @dataclass
 class DataSeries:
     key: str
@@ -116,12 +155,33 @@ class FactorResult:
     detail: str
     source: str
     missing: bool = False
+    stale: bool = False
 
     @property
     def contribution(self) -> Optional[float]:
         if self.signal is None:
             return None
         return self.weight * self.signal
+
+@dataclass
+class MonthlyMACDAlert:
+    index_key: str
+    index_name: str
+    as_of: Optional[str]
+    source: str
+    level: str
+    action: str
+    is_live_month: bool
+    close: Optional[float]
+    dif: Optional[float]
+    dea: Optional[float]
+    gap: Optional[float]
+    previous_completed_gap: Optional[float]
+    gap_daily_slope: Optional[float]
+    estimated_trading_days_to_cross: Optional[float]
+    cross_price: Optional[float]
+    distance_to_cross_pct: Optional[float]
+    reason: str
 
 @dataclass
 class EngineResult:
@@ -133,8 +193,11 @@ class EngineResult:
     risk_level: str
     resonance_adjustment: float
     missing_critical: List[str]
+    stale_critical: List[str]
+    stale_keys: List[str]
     warnings: List[str]
     factors: List[FactorResult]
+    monthly_macd_alerts: List[MonthlyMACDAlert]
     decision_path: List[str]
 
 def clip(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
@@ -214,21 +277,82 @@ class DataHub:
         self.warnings: List[str] = []
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    def add(self, key: str, s: pd.Series, source: str, note: str = "") -> None:
-        if s is None:
-            return
+    @staticmethod
+    def _normalise_series(s: pd.Series) -> pd.Series:
         s = pd.Series(s).copy()
         try:
             s.index = pd.to_datetime(s.index)
+            if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
+                s.index = s.index.tz_convert(None)
             s = s[~s.index.duplicated(keep="last")].sort_index()
         except Exception:
             pass
-        s = pd.to_numeric(s, errors="coerce").dropna()
+        return pd.to_numeric(s, errors="coerce").dropna()
+
+    def add(self, key: str, s: pd.Series, source: str, note: str = "",
+            merge: bool = False, prefer_new: bool = True,
+            persist: bool = True) -> None:
+        if s is None:
+            return
+        s = self._normalise_series(s)
         if len(s) == 0:
             return
+        if merge and key in self.series:
+            old = self.series[key].values
+            if prefer_new:
+                s = s.combine_first(old).sort_index()
+                combined_source = f"{source} | fallback:{self.series[key].source}"
+            else:
+                s = old.combine_first(s).sort_index()
+                combined_source = f"{self.series[key].source} | fallback:{source}"
+            source = combined_source
         last_date = s.index[-1] if isinstance(s.index, pd.DatetimeIndex) else None
         self.series[key] = DataSeries(key, s, source, last_date, note)
+        if persist and isinstance(s.index, pd.DatetimeIndex):
+            self._save_series_cache(key, s, source)
+
+    def _cache_path(self, key: str) -> Path:
+        safe_key = "".join(c for c in key if c.isalnum() or c in "_-")
+        return CACHE_DIR / f"{safe_key}.csv"
+
+    def _save_series_cache(self, key: str, s: pd.Series, source: str) -> None:
+        """Persist successful observations so a temporary provider outage is not data loss."""
+        try:
+            path = self._cache_path(key)
+            cached = pd.DataFrame({"date": s.index, "value": s.values})
+            cached["source"] = source
+            cached.to_csv(path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            self.warnings.append(f"缓存写入失败 {key}: {e}")
+
+    def load_series_cache(self) -> None:
+        if not CACHE_DIR.exists():
+            return
+        loaded = 0
+        for path in CACHE_DIR.glob("*.csv"):
+            try:
+                df = pd.read_csv(path)
+                if not {"date", "value"}.issubset(df.columns):
+                    continue
+                origin = str(df["source"].dropna().iloc[-1]) if "source" in df and not df["source"].dropna().empty else "unknown"
+                primary_origin = origin.split("|", 1)[0].strip()
+                if primary_origin.startswith("local-cache:"):
+                    primary_origin = primary_origin[len("local-cache:"):]
+                self.add(
+                    path.stem,
+                    pd.Series(pd.to_numeric(df["value"], errors="coerce").values,
+                              index=pd.to_datetime(df["date"], errors="coerce")),
+                    f"local-cache:{primary_origin}",
+                    note=f"cached source: {origin}",
+                    persist=False,
+                )
+                loaded += 1
+            except Exception as e:
+                self.warnings.append(f"缓存读取失败 {path.name}: {e}")
+        if loaded:
+            self.warnings.append(f"已加载 {loaded} 个本地序列缓存；实时数据会覆盖同日缓存。")
 
     def get(self, key: str) -> Optional[pd.Series]:
         obj = self.series.get(key)
@@ -237,24 +361,79 @@ class DataHub:
     def source(self, key: str) -> str:
         return self.series[key].source if key in self.series else "MISSING"
 
+    def _is_transient_error(self, e: Exception) -> bool:
+        msg = str(e).lower()
+        transient_tokens = [
+            "timed out", "timeout", "remote end closed", "remotedisconnected",
+            "connection aborted", "connection reset", "temporarily unavailable",
+            "429", "503", "504", "502", "too many requests"
+        ]
+        return any(x in msg for x in transient_tokens)
+
+    def _call_with_retry(self, label: str, fn: Callable[[], Any], retries: int = NETWORK_RETRIES) -> Any:
+        if retries < 1:
+            retries = 1
+        last_error = None
+        for i in range(retries):
+            try:
+                return fn()
+            except Exception as e:
+                last_error = e
+                if i >= retries - 1 or not self._is_transient_error(e):
+                    break
+                time.sleep(NETWORK_BACKOFF_SEC * (i + 1))
+        self.warnings.append(f"{label} 获取失败: {last_error}")
+        return None
+
+    @staticmethod
+    def _max_age_for_source(src: str) -> int:
+        src = src.lower()
+        if "fred" in src:
+            return MAX_AGE_DAYS["fred"]
+        if "manual" in src:
+            return MAX_AGE_DAYS["manual"]
+        if "snapshot" in src:
+            return MAX_AGE_DAYS["snapshot"]
+        if "akshare" in src and ("macro" in src or "bond" in src):
+            return MAX_AGE_DAYS["ak_macro"]
+        return MAX_AGE_DAYS["market"]
+
+    def get_stale_keys(self) -> Set[str]:
+        out = set()
+        now = pd.Timestamp.now().normalize()
+        for key, ds in self.series.items():
+            if ds.last_date is None:
+                continue
+            last = pd.Timestamp(ds.last_date)
+            if last.tzinfo is not None:
+                last = last.tz_convert(None)
+            age = (now - last.normalize()).days
+            if age > self._max_age_for_source(ds.source):
+                out.add(key)
+        return out
+
     def fetch_yfinance(self) -> None:
         if yf is None:
             self.warnings.append("未安装 yfinance：海外指数/汇率/商品等自动行情将缺失。")
             return
         end = datetime.now().date() + timedelta(days=1)
-        start = end - timedelta(days=self.history_days * 2)
-        for key, ticker in YF_TICKERS.items():
-            try:
-                df = yf.download(
-                    ticker,
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
+        for key, tickers in YF_TICKER_CANDIDATES.items():
+            lookback = max(self.history_days * 2, MACD_HISTORY_DAYS) if key in MACD_INDEX_KEYS else self.history_days * 2
+            start = end - timedelta(days=lookback)
+            ok = False
+            for ticker in tickers:
+                df = self._call_with_retry(
+                    f"yfinance {key}({ticker})",
+                    lambda t=ticker: yf.download(
+                        t,
+                        start=start.isoformat(),
+                        end=end.isoformat(),
+                        auto_adjust=False,
+                        progress=False,
+                        threads=False,
+                    ),
                 )
                 if df is None or df.empty:
-                    self.warnings.append(f"yfinance 无数据: {key} ({ticker})")
                     continue
                 if isinstance(df.columns, pd.MultiIndex):
                     close = df["Close"] if "Close" in df.columns.get_level_values(0) else df.iloc[:, 0]
@@ -262,42 +441,67 @@ class DataHub:
                         close = close.iloc[:, 0]
                 else:
                     close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
-                self.add(key, close, f"Yahoo Finance via yfinance ({ticker})")
-            except Exception as e:
-                self.warnings.append(f"yfinance 获取失败 {key}({ticker}): {e}")
+                self.add(key, close, f"Yahoo Finance via yfinance ({ticker})", merge=True)
+                ok = True
+                if len(tickers) > 1 and ticker != tickers[0]:
+                    self.warnings.append(f"yfinance 主ticker不可用，{key} 已回退到 {ticker}")
+                break
+            if not ok:
+                self.warnings.append(f"yfinance 无数据: {key} ({', '.join(tickers)})")
 
     def fetch_fred(self) -> None:
         api_key = os.getenv("FRED_API_KEY", "").strip()
+        start = (datetime.now().date() - timedelta(days=self.history_days * 2)).isoformat()
+        api_url = "https://api.stlouisfed.org/fred/series/observations"
+        csv_url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
         if not api_key:
             self.warnings.append(
-                "未设置 FRED_API_KEY：US10Y_REAL、HY_OAS 等官方宏观序列可能缺失；"
-                "程序会降低置信度，而不是假装数据存在。"
+                "未设置 FRED_API_KEY：已自动改用 FRED 官方公开 CSV；"
+                "如公开端点受限，再配置 API Key。"
             )
-            return
-
-        start = (datetime.now().date() - timedelta(days=self.history_days * 2)).isoformat()
-        url = "https://api.stlouisfed.org/fred/series/observations"
         for key, sid in FRED_SERIES.items():
+            if api_key:
+                params = {
+                    "series_id": sid,
+                    "api_key": api_key,
+                    "file_type": "json",
+                    "observation_start": start,
+                    "sort_order": "asc",
+                }
+                url = api_url
+            else:
+                params = {"id": sid, "cosd": start}
+                url = csv_url
+            r = self._call_with_retry(
+                f"FRED:{sid}",
+                lambda url=url, params=params: requests.get(
+                    url, params=params, timeout=DEFAULT_REQUEST_TIMEOUT
+                ),
+            )
+            if r is None:
+                continue
             try:
-                r = requests.get(
-                    url,
-                    params={
-                        "series_id": sid,
-                        "api_key": api_key,
-                        "file_type": "json",
-                        "observation_start": start,
-                        "sort_order": "asc",
-                    },
-                    timeout=20,
-                )
                 r.raise_for_status()
-                obs = r.json().get("observations", [])
-                rows = [(x["date"], float(x["value"])) for x in obs if x.get("value") not in (None, ".")]
+                if api_key:
+                    obs = r.json().get("observations", [])
+                    rows = [(x["date"], float(x["value"])) for x in obs if x.get("value") not in (None, ".")]
+                    source = f"FRED API:{sid}"
+                else:
+                    df = pd.read_csv(StringIO(r.text))
+                    date_col = self._find_col(df, ["observation_date", "date"])
+                    value_col = self._find_col(df, [sid])
+                    if not date_col or not value_col:
+                        raise ValueError(f"FRED CSV 字段异常: {list(df.columns)}")
+                    values = pd.to_numeric(df[value_col], errors="coerce")
+                    valid = values.notna()
+                    rows = list(zip(df.loc[valid, date_col].astype(str), values.loc[valid].astype(float)))
+                    source = f"FRED public CSV:{sid}"
                 if rows:
                     self.add(
                         key,
                         pd.Series([v for _, v in rows], index=pd.to_datetime([d for d, _ in rows])),
-                        f"FRED:{sid}"
+                        source,
+                        merge=True,
                     )
                 else:
                     self.warnings.append(f"FRED 无有效数据: {sid}")
@@ -308,11 +512,14 @@ class DataHub:
         if ak is None:
             self.warnings.append("未安装 AKShare：A股横截面、融资余额、中国10Y、BOJ等数据将缺失。")
             return
+        start = (datetime.now().date() - timedelta(days=self.history_days * 2)).strftime("%Y%m%d")
+        df = self._call_with_retry(
+            "AKShare bond_zh_us_rate",
+            lambda: ak.bond_zh_us_rate(start_date=start),
+        )
+        if df is None or df.empty:
+            return
         try:
-            start = (datetime.now().date() - timedelta(days=self.history_days * 2)).strftime("%Y%m%d")
-            df = ak.bond_zh_us_rate(start_date=start)
-            if df is None or df.empty:
-                return
             date_col = self._find_col(df, ["日期", "date"])
             if not date_col:
                 self.warnings.append("bond_zh_us_rate 找不到日期列。")
@@ -322,50 +529,131 @@ class DataHub:
             us10 = self._find_col(df, ["美国国债收益率10年", "美国10年", "美国国债10年"])
             if cn10:
                 self.add("CN10Y", pd.Series(pd.to_numeric(df[cn10], errors="coerce").values, index=idx),
-                         "AKShare:bond_zh_us_rate")
-            if us10 and "US10Y" not in self.series:
+                         "AKShare:bond_zh_us_rate", merge=True)
+            if us10:
                 self.add("US10Y", pd.Series(pd.to_numeric(df[us10], errors="coerce").values, index=idx),
-                         "AKShare:bond_zh_us_rate (fallback)")
+                         "AKShare:bond_zh_us_rate (fallback)", merge=True, prefer_new=False)
         except Exception as e:
             self.warnings.append(f"AKShare 中美国债收益率获取失败: {e}")
 
     def fetch_a_index_history(self) -> None:
-        """用 AKShare 获取重要A股指数的日线成交额/成交量；用于相对MA20确认。"""
-        if ak is None:
+        """Fetch and merge A-share indices from AKShare and Baostock.
+
+        AKShare remains the preferred source. Baostock is queried independently and
+        fills missing dates instead of being used only after a total AKShare failure.
+        This prevents a partially truncated primary response from looking healthy.
+        """
+        if ak is None and bs is None:
+            self.warnings.append("未安装 AKShare 和 baostock：A股指数历史将只使用本地缓存/Yahoo。")
             return
-        for key, symbol in AK_INDEX_SYMBOLS.items():
+        bs_login_ok = False
+        if bs is not None:
             try:
-                df = ak.stock_zh_index_daily_em(symbol=symbol)
-                if df is None or df.empty:
-                    self.warnings.append(f"A股指数历史为空: {key}({symbol})")
-                    continue
-                date_col = self._find_col(df, ["date", "日期"])
-                close_col = self._find_col(df, ["close", "收盘"])
-                amount_col = self._find_col(df, ["amount", "成交额"])
-                volume_col = self._find_col(df, ["volume", "成交量"])
-                if not date_col:
-                    self.warnings.append(f"A股指数历史缺日期列: {key}")
-                    continue
-                idx = pd.to_datetime(df[date_col], errors="coerce")
-                if close_col and key not in self.series:
-                    self.add(key, pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if amount_col:
-                    self.add(key+"_INDEX_AMOUNT",
-                             pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
-                if volume_col:
-                    self.add(key+"_INDEX_VOLUME",
-                             pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
-                             f"AKShare:stock_zh_index_daily_em({symbol})")
+                lg = bs.login()
+                if getattr(lg, "error_code", "1") == "0":
+                    bs_login_ok = True
+                else:
+                    self.warnings.append(f"baostock 登录失败: {getattr(lg, 'error_msg', 'unknown')}")
             except Exception as e:
-                self.warnings.append(f"A股指数历史获取失败 {key}({symbol}): {e}")
+                self.warnings.append(f"baostock 登录失败: {e}")
+
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=max(self.history_days * 2, MACD_HISTORY_DAYS))
+
+        def ingest(key: str, df: pd.DataFrame, source: str,
+                   prefer_new: bool = True) -> bool:
+            if df is None or df.empty:
+                return False
+            date_col = self._find_col(df, ["date", "日期"])
+            close_col = self._find_col(df, ["close", "收盘"])
+            amount_col = self._find_col(df, ["amount", "成交额"])
+            volume_col = self._find_col(df, ["volume", "成交量"])
+            if not date_col or not close_col:
+                self.warnings.append(f"A股指数历史字段不完整: {key}, 来源={source}")
+                return False
+            idx = pd.to_datetime(df[date_col], errors="coerce")
+            self.add(key,
+                     pd.Series(pd.to_numeric(df[close_col], errors="coerce").values, index=idx),
+                     source, merge=True, prefer_new=prefer_new)
+            if amount_col:
+                self.add(key + "_INDEX_AMOUNT",
+                         pd.Series(pd.to_numeric(df[amount_col], errors="coerce").values, index=idx),
+                         source, merge=True, prefer_new=prefer_new)
+            if volume_col:
+                self.add(key + "_INDEX_VOLUME",
+                         pd.Series(pd.to_numeric(df[volume_col], errors="coerce").values, index=idx),
+                         source, merge=True, prefer_new=prefer_new)
+            return True
+
+        for key, symbol in AK_INDEX_SYMBOLS.items():
+            success = key in self.series and len(self.series[key].values) > 0
+            if ak is not None:
+                df = self._call_with_retry(
+                    f"AKShare stock_zh_index_daily_em {key}({symbol})",
+                    lambda sym=symbol: ak.stock_zh_index_daily_em(symbol=sym),
+                )
+                success = ingest(
+                    key, df, f"AKShare:stock_zh_index_daily_em({symbol})", prefer_new=True
+                ) or success
+                if (df is None or df.empty) and hasattr(ak, "index_zh_a_hist"):
+                    plain = AK_INDEX_FALLBACK_SYMBOLS[key]
+                    df2 = self._call_with_retry(
+                        f"AKShare index_zh_a_hist {key}({plain})",
+                        lambda sym=plain: ak.index_zh_a_hist(
+                            symbol=sym,
+                            period="daily",
+                            start_date=start_date.strftime("%Y%m%d"),
+                            end_date=end_date.strftime("%Y%m%d"),
+                        ),
+                    )
+                    success = ingest(
+                        key, df2, f"AKShare:index_zh_a_hist({plain})", prefer_new=True
+                    ) or success
+
+            if bs_login_ok and key in BAOSTOCK_INDEX_SYMBOLS:
+                code = BAOSTOCK_INDEX_SYMBOLS[key]
+                rs = self._call_with_retry(
+                    f"baostock {key}({code})",
+                    lambda c=code: bs.query_history_k_data_plus(
+                        c,
+                        "date,close,volume,amount",
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat(),
+                        frequency="d",
+                        adjustflag="3",
+                    ),
+                )
+                if rs is not None and getattr(rs, "error_code", "1") == "0":
+                    rows = []
+                    while rs.next():
+                        rows.append(rs.get_row_data())
+                    if rows:
+                        dfb = pd.DataFrame(rows, columns=["date", "close", "volume", "amount"])
+                        success = ingest(
+                            key, dfb,
+                            f"baostock:query_history_k_data_plus({code})",
+                            prefer_new=False,
+                        ) or success
+            if not success:
+                self.warnings.append(f"A股指数历史仍缺失: {key}")
+        if bs_login_ok:
+            try:
+                bs.logout()
+            except Exception:
+                pass
 
     def fetch_a_share_snapshot(self) -> None:
         if ak is None:
             return
         try:
-            df = ak.stock_zh_a_spot_em()
+            source = None
+            df = self._call_with_retry("AKShare stock_zh_a_spot_em", lambda: ak.stock_zh_a_spot_em())
+            if df is not None and not df.empty:
+                source = "AKShare:stock_zh_a_spot_em"
+            elif hasattr(ak, "stock_zh_a_spot"):
+                df = self._call_with_retry("AKShare stock_zh_a_spot", lambda: ak.stock_zh_a_spot())
+                if df is not None and not df.empty:
+                    source = "AKShare:stock_zh_a_spot"
             if df is None or df.empty:
                 self.warnings.append("A股实时横截面为空。")
                 return
@@ -393,14 +681,15 @@ class DataHub:
                 total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
 
             now = pd.Timestamp.now().normalize()
-            self.add("A_BREADTH", pd.Series([adv], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_DECLINERS", pd.Series([dec], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_STRONG3", pd.Series([strong], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_WEAK3", pd.Series([weak], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), "AKShare:stock_zh_a_spot_em")
-            self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), "AKShare:stock_zh_a_spot_em")
+            src = source or "AKShare:stock_zh_a_spot_em"
+            self.add("A_BREADTH", pd.Series([adv], index=[now]), src, merge=True)
+            self.add("A_DECLINERS", pd.Series([dec], index=[now]), src, merge=True)
+            self.add("A_STRONG3", pd.Series([strong], index=[now]), src, merge=True)
+            self.add("A_WEAK3", pd.Series([weak], index=[now]), src, merge=True)
+            self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), src, merge=True)
+            self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), src, merge=True)
             if not math.isnan(total_amount):
-                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), "AKShare:stock_zh_a_spot_em")
+                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), src, merge=True)
 
             self._save_snapshot({
                 "date": now.strftime("%Y-%m-%d"),
@@ -417,9 +706,9 @@ class DataHub:
             if not hist.empty:
                 hist.index = pd.to_datetime(hist["date"])
                 if "breadth" in hist:
-                    self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history")
+                    self.add("A_BREADTH_HIST", hist["breadth"], "local snapshot history", merge=True)
                 if "turnover" in hist:
-                    self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history")
+                    self.add("A_TURNOVER_HIST", hist["turnover"], "local snapshot history", merge=True)
         except Exception as e:
             self.warnings.append(f"A股横截面获取失败: {e}")
 
@@ -465,7 +754,7 @@ class DataHub:
         if series_list:
             merged = pd.concat(series_list, axis=1).sort_index().ffill()
             merged["TOTAL"] = merged.sum(axis=1, min_count=1)
-            self.add("MARGIN_BALANCE", merged["TOTAL"], "AKShare:SSE+SZ margin")
+            self.add("MARGIN_BALANCE", merged["TOTAL"], "AKShare:SSE+SZ margin", merge=True)
 
     def fetch_boj_policy(self) -> None:
         if ak is None:
@@ -483,7 +772,7 @@ class DataHub:
                 vals = df[val_col].astype(str).str.replace("%", "", regex=False).replace({"--": np.nan})
                 self.add("BOJ_RATE",
                          pd.Series(pd.to_numeric(vals, errors="coerce").values, index=idx).dropna(),
-                         "AKShare:macro_bank_japan_interest_rate")
+                         "AKShare:macro_bank_japan_interest_rate", merge=True)
         except Exception as e:
             self.warnings.append(f"日本央行利率获取失败: {e}")
 
@@ -500,16 +789,16 @@ class DataHub:
         for key, obj in data.items():
             try:
                 if isinstance(obj, (int, float)):
-                    self.add(key, pd.Series([float(obj)], index=[now]), "manual")
+                    self.add(key, pd.Series([float(obj)], index=[now]), "manual", merge=True)
                 elif isinstance(obj, dict) and "value" in obj:
                     date = pd.to_datetime(obj.get("date", now))
-                    self.add(key, pd.Series([float(obj["value"])], index=[date]), "manual")
+                    self.add(key, pd.Series([float(obj["value"])], index=[date]), "manual", merge=True)
                 elif isinstance(obj, list):
                     idx, vals = [], []
                     for row in obj:
                         idx.append(pd.to_datetime(row["date"]))
                         vals.append(float(row["value"]))
-                    self.add(key, pd.Series(vals, index=idx), "manual")
+                    self.add(key, pd.Series(vals, index=idx), "manual", merge=True)
             except Exception as e:
                 self.warnings.append(f"手工覆盖 {key} 读取失败: {e}")
 
@@ -556,29 +845,184 @@ class DataHub:
             if last.tzinfo is not None:
                 last = last.tz_convert(None)
             age = (now - last.normalize()).days
-            src = ds.source.lower()
-            if "fred" in src:
-                max_age = MAX_AGE_DAYS["fred"]
-            elif "manual" in src:
-                max_age = MAX_AGE_DAYS["manual"]
-            elif "snapshot" in src:
-                max_age = MAX_AGE_DAYS["snapshot"]
-            elif "akshare" in src and ("macro" in src or "bond" in src):
-                max_age = MAX_AGE_DAYS["ak_macro"]
-            else:
-                max_age = MAX_AGE_DAYS["market"]
+            max_age = self._max_age_for_source(ds.source)
             if age > max_age:
                 out.append(f"数据可能过期: {key} 最后日期={last.date()}, 已滞后 {age} 天, 来源={ds.source}")
         return out
+
+def _monthly_macd_frame(daily_close: pd.Series) -> pd.DataFrame:
+    """Return standard 12/26/9 MACD from month-end closes.
+
+    The last row intentionally uses the latest daily close of the current month,
+    so the engine sees an intramonth crossover instead of waiting for month-end.
+    """
+    s = DataHub._normalise_series(daily_close)
+    if not isinstance(s.index, pd.DatetimeIndex) or s.empty:
+        return pd.DataFrame(columns=["close", "dif", "dea", "gap", "histogram"])
+    periods = s.index.to_period("M")
+    monthly = s.groupby(periods).last().astype(float)
+    monthly.index = monthly.index.to_timestamp(how="end").normalize()
+    dif = monthly.ewm(span=12, adjust=False).mean() - monthly.ewm(span=26, adjust=False).mean()
+    dea = dif.ewm(span=9, adjust=False).mean()
+    gap = dif - dea
+    return pd.DataFrame({
+        "close": monthly,
+        "dif": dif,
+        "dea": dea,
+        "gap": gap,
+        "histogram": 2.0 * gap,
+    })
+
+def _macd_gap_for_candidate(completed_months: pd.Series, candidate_close: float) -> float:
+    candidate_date = (
+        completed_months.index[-1] + pd.offsets.MonthEnd(1)
+        if len(completed_months) else pd.Timestamp.now().normalize()
+    )
+    candidate = pd.concat([
+        completed_months.astype(float),
+        pd.Series([float(candidate_close)], index=[candidate_date]),
+    ])
+    return float(_monthly_macd_frame(candidate)["gap"].iloc[-1])
+
+def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
+                          source: str = "MISSING",
+                          now: Optional[pd.Timestamp] = None) -> MonthlyMACDAlert:
+    name = INDEX_NAMES.get(index_key, index_key)
+    now = pd.Timestamp.now().normalize() if now is None else pd.Timestamp(now).normalize()
+    if daily_close is None:
+        return MonthlyMACDAlert(index_key, name, None, source, "MISSING", "NO_SIGNAL", False,
+                                None, None, None, None, None, None, None, None, None,
+                                "指数日线缺失，无法计算月线MACD。")
+
+    daily = DataHub._normalise_series(daily_close)
+    frame = _monthly_macd_frame(daily)
+    if len(frame) < 35:
+        as_of = daily.index[-1].date().isoformat() if len(daily) else None
+        return MonthlyMACDAlert(index_key, name, as_of, source, "INSUFFICIENT_HISTORY", "NO_SIGNAL", False,
+                                latest(daily), None, None, None, None, None, None, None, None,
+                                f"月线样本仅 {len(frame)} 个月，至少需要35个月。")
+
+    as_of_ts = pd.Timestamp(daily.index[-1]).tz_localize(None) if pd.Timestamp(daily.index[-1]).tzinfo else pd.Timestamp(daily.index[-1])
+    is_live = as_of_ts.to_period("M") == now.to_period("M")
+    row = frame.iloc[-1]
+    gap = float(row["gap"])
+    previous_gap = float(frame["gap"].iloc[-2])
+
+    # Track how the live monthly MACD gap moves after each daily close.
+    live_gap_points: List[float] = []
+    if is_live:
+        current_period = as_of_ts.to_period("M")
+        for d in daily[daily.index.to_period("M") == current_period].tail(10).index:
+            partial = _monthly_macd_frame(daily.loc[:d])
+            if not partial.empty:
+                live_gap_points.append(float(partial["gap"].iloc[-1]))
+    slope = None
+    days_to_cross = None
+    if len(live_gap_points) >= 3:
+        slope = float(np.polyfit(np.arange(len(live_gap_points), dtype=float), live_gap_points, 1)[0])
+        if slope < 0 and gap > 0:
+            days_to_cross = float(gap / -slope)
+
+    # Because EMA is linear in the current close, two nearby evaluations give the
+    # exact price sensitivity (up to floating-point noise) and therefore the
+    # current-month close that would put DIF exactly on DEA.
+    cross_price = None
+    distance = None
+    if is_live and gap > 0:
+        completed = frame["close"].iloc[:-1]
+        close = float(row["close"])
+        delta = max(abs(close) * 0.01, 1e-6)
+        low_gap = _macd_gap_for_candidate(completed, close - delta)
+        high_gap = _macd_gap_for_candidate(completed, close + delta)
+        sensitivity = (high_gap - low_gap) / (2.0 * delta)
+        if sensitivity > 0:
+            estimate = close - gap / sensitivity
+            estimate_distance = (close - estimate) / close * 100.0 if close else None
+            if estimate > 0 and estimate_distance is not None and 0 <= estimate_distance <= 50:
+                cross_price = float(estimate)
+                distance = float(estimate_distance)
+
+    completed_cross = False
+    if is_live and len(frame) >= 3:
+        completed_cross = float(frame["gap"].iloc[-2]) <= 0 < float(frame["gap"].iloc[-3])
+    elif not is_live:
+        completed_cross = gap <= 0 < previous_gap
+
+    shrinking = gap > 0 and (gap < previous_gap or (slope is not None and slope < 0))
+    erosion = None
+    if previous_gap > 0 and shrinking:
+        erosion = (previous_gap - gap) / previous_gap
+
+    if is_live and gap <= 0 < previous_gap:
+        level, action = "DEATH_CROSS_LIVE", "SELL_NOW"
+        reason = "本月尚未收盘，但实时月线DIF已下穿DEA；按上证规则应立即按死叉处理。"
+    elif completed_cross:
+        level, action = "DEATH_CROSS_CONFIRMED", "SELL_NOW"
+        reason = "最近一个已完成月线发生DIF下穿DEA，死叉已确认。"
+    elif gap <= 0:
+        level, action = "BEARISH", "STAY_OUT"
+        reason = "月线DIF仍在DEA下方，处于死叉后的空头区间。"
+    elif shrinking and (
+        (days_to_cross is not None and days_to_cross <= 5)
+        or (distance is not None and distance <= 2.5)
+        or (erosion is not None and erosion >= 0.75)
+    ):
+        level, action = "PRE_DEATH_CROSS_CRITICAL", "PREPARE_SELL"
+        reason = "月线MACD正差快速收窄，按日内斜率/临界价格判断已进入死叉高危区。"
+    elif shrinking and (
+        (days_to_cross is not None and days_to_cross <= 15)
+        or (distance is not None and distance <= 6.0)
+        or (erosion is not None and erosion >= 0.45)
+    ):
+        level, action = "PRE_DEATH_CROSS_WARNING", "REDUCE_RISK"
+        reason = "月线MACD正差持续收窄，已触发死叉提前预警。"
+    elif shrinking:
+        level, action = "WATCH", "WATCH_DAILY"
+        reason = "月线MACD仍为多头，但正差在收窄；需逐日监控。"
+    else:
+        level, action = "SAFE", "NO_ACTION"
+        reason = "月线MACD未显示死叉临近。"
+
+    return MonthlyMACDAlert(
+        index_key=index_key,
+        index_name=name,
+        as_of=as_of_ts.date().isoformat(),
+        source=source,
+        level=level,
+        action=action,
+        is_live_month=is_live,
+        close=round(float(row["close"]), 4),
+        dif=round(float(row["dif"]), 6),
+        dea=round(float(row["dea"]), 6),
+        gap=round(gap, 6),
+        previous_completed_gap=round(previous_gap, 6),
+        gap_daily_slope=None if slope is None else round(slope, 6),
+        estimated_trading_days_to_cross=None if days_to_cross is None else round(days_to_cross, 1),
+        cross_price=None if cross_price is None else round(cross_price, 2),
+        distance_to_cross_pct=None if distance is None else round(distance, 2),
+        reason=reason,
+    )
+
+def build_monthly_macd_alerts(hub: DataHub) -> List[MonthlyMACDAlert]:
+    stale = hub.get_stale_keys()
+    alerts = []
+    for key in MACD_INDEX_KEYS:
+        alert = evaluate_monthly_macd(key, hub.get(key), hub.source(key))
+        if key in stale and alert.level not in {"MISSING", "INSUFFICIENT_HISTORY"}:
+            alert.level = "DATA_STALE"
+            alert.action = "VERIFY_DATA"
+            alert.reason = f"指数最后日期为 {alert.as_of}，数据已过期；禁止用旧数据触发交易动作。"
+        alerts.append(alert)
+    return alerts
 
 def factor_missing(name, group, weight, source="MISSING", detail="缺失") -> FactorResult:
     return FactorResult(name, group, weight, None, None, detail, source, True)
 
 def make_factor(name: str, group: str, weight: float, signal: Optional[float],
-                value: Optional[float], detail: str, source: str) -> FactorResult:
+                value: Optional[float], detail: str, source: str, stale: bool = False) -> FactorResult:
     if signal is None or value is None:
         return factor_missing(name, group, weight, source, detail)
-    return FactorResult(name, group, weight, clip(signal), float(value), detail, source, False)
+    return FactorResult(name, group, weight, clip(signal), float(value), detail, source, False, stale)
 
 class FactorEngine:
     def __init__(self, hub: DataHub):
@@ -902,6 +1346,52 @@ class FactorEngine:
             sig = None if x is None else piecewise_risk(x, [(-3,1),(-1.5,0.6),(-0.5,0.2),(0,0),(0.5,-0.1),(1.5,-0.2)])
             R.append(make_factor(name,"A股衍生品",w,sig,x,f"{key}={x}%；负值贴水偏风险",h.source(key)))
 
+        stale_keys = h.get_stale_keys()
+        factor_source_keys = {
+            "美债10Y绝对水平": ["US10Y"],
+            "美债10Y斜率/变化速度": ["US10Y"],
+            "美债10Y实际利率": ["US10Y_REAL"],
+            "美债2Y/Fed预期重定价": ["US2Y"],
+            "美联储政策利率方向": ["FED_FUNDS"],
+            "日本央行政策利率方向": ["BOJ_RATE"],
+            "美国高收益债OAS": ["HY_OAS"],
+            "离岸人民币USD/CNH": ["USDCNH"],
+            "美元指数DXY": ["DXY"],
+            "中美10Y国债利差": ["CN10Y", "US10Y"],
+            "VIX恐慌指数": ["VIX"],
+            "恒生科技": ["HSTECH"],
+            "恒生指数": ["HSI"],
+            "富时中国A50": ["A50"],
+            "纳斯达克100": ["NASDAQ100"],
+            "费城半导体SOX": ["SOX"],
+            "日经225": ["NIKKEI"],
+            "韩国KOSPI": ["KOSPI"],
+            "日元套息平仓风险": ["USDJPY"],
+            "铜价趋势": ["COPPER"],
+            "原油趋势": ["OIL"],
+            "铁矿石趋势": ["IRON_ORE"],
+            "沪深300自身趋势": ["CSI300"],
+            "创业板趋势": ["CHINEXT"],
+            "科创50趋势": ["STAR50"],
+            "中证1000趋势": ["CSI1000"],
+            "A股上涨家数比例": ["A_BREADTH"],
+            "A股强弱扩散差": ["A_WEAK3", "A_STRONG3"],
+            "A股近似跌停比例": ["A_LIMIT_DOWN_RATIO"],
+            "沪深300成交额确认": ["CSI300_INDEX_AMOUNT"],
+            "中证1000成交额确认": ["CSI1000_INDEX_AMOUNT"],
+            "创业板成交额确认": ["CHINEXT_INDEX_AMOUNT"],
+            "科创50成交额确认": ["STAR50_INDEX_AMOUNT"],
+            "A股成交额/MA20": ["A_TURNOVER_HIST"],
+            "融资余额变化": ["MARGIN_BALANCE"],
+            "主要宽基ETF 5日净流入": ["ETF_FLOW_5D_BN"],
+            "IF基差": ["IF_BASIS_PCT"],
+            "IC基差": ["IC_BASIS_PCT"],
+            "IM基差": ["IM_BASIS_PCT"],
+        }
+        for r in R:
+            keys = factor_source_keys.get(r.name, [])
+            r.stale = any(k in stale_keys for k in keys)
+
         return R
 
 def compute_resonance(f: Dict[str, Optional[float]]) -> Tuple[float, List[str]]:
@@ -931,8 +1421,30 @@ def compute_resonance(f: Dict[str, Optional[float]]) -> Tuple[float, List[str]]:
 
 def rule_decision_tree(buy: float, sell: float, confidence: float,
                        missing_critical: List[str],
-                       f: Dict[str, Optional[float]]) -> Tuple[str, List[str]]:
+                       f: Dict[str, Optional[float]],
+                       monthly_macd_alerts: Optional[List[MonthlyMACDAlert]] = None) -> Tuple[str, List[str]]:
     path = []
+    sse_macd = next(
+        (x for x in (monthly_macd_alerts or []) if x.index_key == "SSE"), None
+    )
+    # The user's explicit risk rule has priority over the composite score. The
+    # current partial month is evaluated every day, so this does not wait for a
+    # month-end bar to close.
+    if sse_macd and sse_macd.level in {"DEATH_CROSS_LIVE", "DEATH_CROSS_CONFIRMED"}:
+        path.append(f"上证指数月线MACD={sse_macd.level} -> 坚决卖出（最高优先级）")
+        return "SELL / 上证月线MACD死叉", path
+    if sse_macd and sse_macd.level == "BEARISH":
+        path.append("上证指数月线DIF仍在DEA下方 -> 保持风险规避")
+        return "RISK_OFF / 上证月线MACD空头区间", path
+    if sse_macd and sse_macd.level == "PRE_DEATH_CROSS_CRITICAL":
+        path.append("上证指数月线MACD死叉高危预警 -> 提前准备卖出/降低仓位")
+        return "PREPARE_SELL / 上证月线MACD高危", path
+    if sse_macd and sse_macd.level == "PRE_DEATH_CROSS_WARNING":
+        path.append("上证指数月线MACD死叉提前预警 -> 暂停新增仓位并准备减仓")
+        return "MACD_WARNING / 暂停加仓，准备减仓", path
+    if sse_macd and sse_macd.level == "WATCH":
+        path.append("上证指数月线MACD正差收窄 -> 每个交易日跟踪")
+
     if confidence < 65 or len(missing_critical) >= 3:
         path.append(f"数据置信度={confidence:.1f}，或关键数据缺失过多 -> DATA_INCOMPLETE")
         return "DATA_INCOMPLETE / 不根据信号交易", path
@@ -966,7 +1478,8 @@ def rule_decision_tree(buy: float, sell: float, confidence: float,
 
 def score_engine(factors: List[FactorResult],
                  features: Dict[str, Optional[float]],
-                 hub: DataHub) -> EngineResult:
+                 hub: DataHub,
+                 monthly_macd_alerts: Optional[List[MonthlyMACDAlert]] = None) -> EngineResult:
     valid = [x for x in factors if not x.missing and x.signal is not None]
     total_weight = sum(x.weight for x in factors)
     valid_weight = sum(x.weight for x in valid)
@@ -980,14 +1493,23 @@ def score_engine(factors: List[FactorResult],
 
     weight_coverage = valid_weight / total_weight if total_weight else 0
     missing_critical = [k for k in sorted(CRITICAL_KEYS) if features.get(k) is None]
-    critical_coverage = 1.0 - len(missing_critical) / len(CRITICAL_KEYS)
+    stale_keys_set = hub.get_stale_keys()
+    stale_critical = [k for k in sorted(CRITICAL_KEYS) if k in stale_keys_set and features.get(k) is not None]
+    stale_keys = sorted(stale_keys_set)
+    critical_coverage = 1.0 - (len(missing_critical) + 0.5 * len(stale_critical)) / len(CRITICAL_KEYS)
+    critical_coverage = float(np.clip(critical_coverage, 0, 1))
     confidence = float(np.clip(100.0*(0.65*weight_coverage + 0.35*critical_coverage), 0, 100))
 
     warnings = list(hub.warnings) + hub.data_quality_warnings()
     if missing_critical:
         warnings.append("关键数据缺失: " + ", ".join(missing_critical))
+    if stale_critical:
+        warnings.append("关键数据过期(stale): " + ", ".join(stale_critical))
 
-    action, path = rule_decision_tree(buy, sell, confidence, missing_critical, features)
+    monthly_macd_alerts = monthly_macd_alerts or []
+    action, path = rule_decision_tree(
+        buy, sell, confidence, missing_critical, features, monthly_macd_alerts
+    )
     path = resonance_notes + path
 
     if sell >= 75: level = "极高"
@@ -998,9 +1520,20 @@ def score_engine(factors: List[FactorResult],
     else: level = "低"
 
     return EngineResult(
-        datetime.now().astimezone().isoformat(timespec="seconds"),
-        round(buy,1), round(sell,1), round(confidence,1), action, level,
-        round(resonance,1), missing_critical, warnings, factors, path
+        timestamp=datetime.now().astimezone().isoformat(timespec="seconds"),
+        buy_score=round(buy, 1),
+        sell_score=round(sell, 1),
+        confidence=round(confidence, 1),
+        action=action,
+        risk_level=level,
+        resonance_adjustment=round(resonance, 1),
+        missing_critical=missing_critical,
+        stale_critical=stale_critical,
+        stale_keys=stale_keys,
+        warnings=warnings,
+        factors=factors,
+        monthly_macd_alerts=monthly_macd_alerts,
+        decision_path=path,
     )
 
 def decision_tree_dot() -> str:
@@ -1010,6 +1543,10 @@ def decision_tree_dot() -> str:
     node [shape=box, style="rounded", fontname="Microsoft YaHei"];
     edge [fontname="Microsoft YaHei"];
 
+    M [label="上证月线MACD\n实时/确认死叉?"];
+    MS [label="SELL\n上证月线MACD死叉"];
+    W [label="上证月线MACD\n高危/提前预警?"];
+    MW [label="PREPARE_SELL / MACD_WARNING"];
     A [label="数据置信度 >= 65% 且关键缺失 < 3?"];
     B [label="DATA_INCOMPLETE\n不根据信号交易"];
     C [label="VIX >= 30 且\nCNH 5日贬值 >= 1% ?"];
@@ -1023,6 +1560,10 @@ def decision_tree_dot() -> str:
     K [label="WATCH_BUY\n观察偏多"];
     L [label="HOLD\n中性等待"];
 
+    M -> MS [label="是"];
+    M -> W [label="否"];
+    W -> MW [label="是"];
+    W -> A [label="否"];
     A -> B [label="否"];
     A -> C [label="是"];
     C -> D [label="是"];
@@ -1058,9 +1599,39 @@ def factor_dataframe(factors: List[FactorResult]) -> pd.DataFrame:
         "weighted_contribution": None if x.contribution is None else round(x.contribution,3),
         "value": x.value,
         "missing": x.missing,
+        "stale": x.stale,
         "source": x.source,
         "detail": x.detail,
     } for x in factors])
+
+def monthly_macd_dataframe(alerts: List[MonthlyMACDAlert]) -> pd.DataFrame:
+    return pd.DataFrame([asdict(x) for x in alerts])
+
+def data_source_health_dataframe(hub: DataHub) -> pd.DataFrame:
+    now = pd.Timestamp.now().normalize()
+    stale = hub.get_stale_keys()
+    rows = []
+    for key, ds in sorted(hub.series.items()):
+        values = ds.values.dropna()
+        first_date = values.index[0] if len(values) and isinstance(values.index, pd.DatetimeIndex) else None
+        last_date = ds.last_date
+        age_days = None
+        if last_date is not None:
+            last = pd.Timestamp(last_date)
+            if last.tzinfo is not None:
+                last = last.tz_convert(None)
+            age_days = int((now - last.normalize()).days)
+        rows.append({
+            "key": key,
+            "source_chain": ds.source,
+            "observations": int(len(values)),
+            "first_date": None if first_date is None else pd.Timestamp(first_date).date().isoformat(),
+            "last_date": None if last_date is None else pd.Timestamp(last_date).date().isoformat(),
+            "age_days": age_days,
+            "stale": key in stale,
+            "note": ds.note,
+        })
+    return pd.DataFrame(rows)
 
 def print_console(result: EngineResult) -> None:
     print("\n" + "="*76)
@@ -1076,6 +1647,21 @@ def print_console(result: EngineResult) -> None:
 
     if result.missing_critical:
         print("关键缺失   :", ", ".join(result.missing_critical))
+    if result.stale_critical:
+        print("关键过期   :", ", ".join(result.stale_critical))
+
+    print("\n月线MACD实时/提前预警（最后一根为本月未完成月线）：")
+    macd_show = monthly_macd_dataframe(result.monthly_macd_alerts)
+    if macd_show.empty:
+        print("  无可用指数数据")
+    else:
+        columns = [
+            "index_name", "as_of", "level", "action", "gap",
+            "gap_daily_slope", "estimated_trading_days_to_cross",
+            "cross_price", "distance_to_cross_pct",
+        ]
+        with pd.option_context("display.max_colwidth", 80, "display.width", 180):
+            print(macd_show[columns].to_string(index=False))
 
     print("\n决策路径：")
     for x in result.decision_path:
@@ -1083,7 +1669,7 @@ def print_console(result: EngineResult) -> None:
 
     print("\n因子明细：")
     show = factor_dataframe(result.factors)[
-        ["group","factor","weight","signal_-1bull_+1bear","value","missing","detail"]
+        ["group","factor","weight","signal_-1bull_+1bear","value","missing","stale","detail"]
     ]
     with pd.option_context("display.max_rows", 100, "display.max_colwidth", 80, "display.width", 180):
         print(show.to_string(index=False))
@@ -1093,7 +1679,8 @@ def print_console(result: EngineResult) -> None:
         for w in result.warnings:
             print("  -", w)
 
-def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> None:
+def save_outputs(result: EngineResult, features: Dict[str, Optional[float]],
+                 hub: Optional[DataHub] = None) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     obj = asdict(result)
     obj["factors"] = [asdict(x) for x in result.factors]
@@ -1106,6 +1693,18 @@ def save_outputs(result: EngineResult, features: Dict[str, Optional[float]]) -> 
     pd.DataFrame([features]).to_csv(
         OUTPUT_DIR / "feature_snapshot.csv", index=False, encoding="utf-8-sig"
     )
+    macd_df = monthly_macd_dataframe(result.monthly_macd_alerts)
+    macd_df.to_csv(
+        OUTPUT_DIR / "monthly_macd_alerts.csv", index=False, encoding="utf-8-sig"
+    )
+    (OUTPUT_DIR / "monthly_macd_alerts.json").write_text(
+        json.dumps([asdict(x) for x in result.monthly_macd_alerts], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if hub is not None:
+        data_source_health_dataframe(hub).to_csv(
+            OUTPUT_DIR / "data_source_health.csv", index=False, encoding="utf-8-sig"
+        )
     save_decision_tree()
 
 def calibration_notes() -> str:
@@ -1120,6 +1719,7 @@ def calibration_notes() -> str:
 
 def run(history_days: int = DEFAULT_HISTORY_DAYS, no_live: bool = False) -> EngineResult:
     hub = DataHub(history_days)
+    hub.load_series_cache()
     if not no_live:
         hub.fetch_yfinance()
         hub.fetch_fred()
@@ -1133,9 +1733,10 @@ def run(history_days: int = DEFAULT_HISTORY_DAYS, no_live: bool = False) -> Engi
     fe = FactorEngine(hub)
     features = fe.build_features()
     factors = fe.evaluate()
-    result = score_engine(factors, features, hub)
+    monthly_macd_alerts = build_monthly_macd_alerts(hub)
+    result = score_engine(factors, features, hub, monthly_macd_alerts)
     print_console(result)
-    save_outputs(result, features)
+    save_outputs(result, features, hub)
     return result
 
 def build_manual_template() -> None:
@@ -1153,6 +1754,13 @@ def build_manual_template() -> None:
     print(f"已生成 {MANUAL_FILE}")
 
 def main():
+    # Windows shells may inherit a legacy code page; keep Chinese alerts readable
+    # and avoid terminating a risk run only because stdout cannot encode them.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
     p = argparse.ArgumentParser(description="A股多因子外部风险评分引擎")
     p.add_argument("--history-days", type=int, default=DEFAULT_HISTORY_DAYS)
     p.add_argument("--no-live", action="store_true", help="不联网，只使用手工/本地数据")

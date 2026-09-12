@@ -27,7 +27,7 @@ class MonthlyMACDTests(unittest.TestCase):
 
         self.assertTrue(alert.is_live_month)
         self.assertEqual("DEATH_CROSS_LIVE", alert.level)
-        self.assertEqual("SELL_NOW", alert.action)
+        self.assertEqual("RISK_UP", alert.action)
         self.assertLessEqual(alert.gap, 0)
         self.assertGreater(alert.previous_completed_gap, 0)
 
@@ -40,17 +40,31 @@ class MonthlyMACDTests(unittest.TestCase):
         self.assertIsNotNone(alert.cross_price)
         self.assertLessEqual(alert.distance_to_cross_pct, 2.5)
 
-    def test_sse_death_cross_overrides_low_composite_confidence(self):
+    def test_sse_death_cross_becomes_factor_not_override(self):
         daily, now = _synthetic_monthly_series(0.0)
         alert = eng.evaluate_monthly_macd("SSE", daily, "synthetic", now=now)
+        factors = eng.build_monthly_macd_factors([alert])
+        sse_factor = next(x for x in factors if x.name == "上证指数月线MACD")
+
+        self.assertGreater(sse_factor.signal, 0)
+        self.assertEqual(0.8, sse_factor.signal)
+
+    def test_sse_death_cross_does_not_force_sell(self):
+        daily, now = _synthetic_monthly_series(0.0)
+        alert = eng.evaluate_monthly_macd("SSE", daily, "synthetic", now=now)
+        macd_factors = eng.build_monthly_macd_factors([alert])
+        factors = [
+            eng.FactorResult("bull", "test", 100.0, -0.7, 1.0, "", "test")
+        ]
+        factors.extend(macd_factors)
+
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
             with patch.object(eng, "STATE_DIR", state), patch.object(eng, "CACHE_DIR", state / "series_cache"):
                 hub = eng.DataHub()
-                result = eng.score_engine([], {}, hub, [alert])
+                result = eng.score_engine(factors, {}, hub, [alert])
 
-        self.assertEqual("SELL / 上证月线MACD死叉", result.action)
-        self.assertIn("最高优先级", result.decision_path[0])
+        self.assertNotEqual("SELL / 上证月线MACD死叉", result.action)
 
 
 class CacheAndMergeTests(unittest.TestCase):

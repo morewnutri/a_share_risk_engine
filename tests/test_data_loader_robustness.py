@@ -81,6 +81,13 @@ class DataLoaderRobustnessTests(unittest.TestCase):
         self.assertEqual(4.25, eng.latest(hub.get("US10Y")))
         self.assertIn("FRED public CSV", hub.source("US10Y"))
 
+    def test_nat_index_is_removed_during_normalisation(self):
+        s = pd.Series([1.0, 2.0], index=[pd.Timestamp("2026-01-01"), pd.NaT])
+        norm = eng.DataHub._normalise_series(s)
+
+        self.assertEqual(1, len(norm))
+        self.assertEqual(pd.Timestamp("2026-01-01"), norm.index[0])
+
 
 if __name__ == "__main__":
     unittest.main()

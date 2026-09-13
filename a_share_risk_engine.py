@@ -136,6 +136,47 @@ AK_INDEX_FALLBACK_SYMBOLS = {
     "STAR50": "000688",
 }
 MACD_INDEX_KEYS = tuple(INDEX_NAMES)
+MONTHLY_MACD_FACTOR_WEIGHTS = {
+    "SSE": 8.0,
+    "CSI300": 4.0,
+    "CSI1000": 2.0,
+    "CHINEXT": 2.0,
+    "STAR50": 2.0,
+}
+MONTHLY_MACD_SIGNAL_MAP = {
+    "DEATH_CROSS_CONFIRMED": 1.00,
+    "DEATH_CROSS_LIVE": 0.80,
+    "BEARISH": 0.55,
+    "BEARISH_RECOVERING": 0.20,
+    "PRE_DEATH_CROSS_CRITICAL": 0.50,
+    "PRE_DEATH_CROSS_WARNING": 0.30,
+    "WATCH": 0.10,
+    "SAFE": 0.00,
+    "BULLISH": -0.20,
+    "GOLDEN_CROSS_LIVE": -0.50,
+    "GOLDEN_CROSS_CONFIRMED": -0.75,
+}
+MONTHLY_MACD_BEARISH_LEVELS = {
+    "DEATH_CROSS_LIVE",
+    "DEATH_CROSS_CONFIRMED",
+    "BEARISH",
+    "BEARISH_RECOVERING",
+}
+FEATURE_FRESHNESS_DEPENDENCIES = {
+    "US10Y_20D_BP": ["US10Y"],
+    "DXY_5D": ["DXY"],
+    "USDCNH_5D": ["USDCNH"],
+    "US10Y_REAL": ["US10Y_REAL"],
+    "VIX": ["VIX"],
+    "HSTECH_1D": ["HSTECH"],
+    "SOX_1D": ["SOX"],
+    "USDJPY_5D": ["USDJPY"],
+    "NIKKEI_5D": ["NIKKEI"],
+    "A_BREADTH": ["A_BREADTH"],
+    "A_TURNOVER_MA20_RATIO": ["A_TURNOVER_HIST"],
+    "HSTECH_5D": ["HSTECH"],
+    "CSI300_5D": ["CSI300"],
+}
 
 @dataclass
 class DataSeries:
@@ -159,7 +200,7 @@ class FactorResult:
 
     @property
     def contribution(self) -> Optional[float]:
-        if self.signal is None:
+        if self.signal is None or self.missing or self.stale:
             return None
         return self.weight * self.signal
 
@@ -248,6 +289,28 @@ def linear_slope_per_day(s: Optional[pd.Series], window: int = 20) -> Optional[f
     x = np.arange(len(y), dtype=float)
     return float(np.polyfit(x, y, 1)[0])
 
+def previous_window_mean_ratio(s: Optional[pd.Series], window: int = 20) -> Optional[float]:
+    if s is None:
+        return None
+    s = s.dropna().astype(float)
+    if len(s) <= window:
+        return None
+    prev = s.iloc[-1-window:-1]
+    if len(prev) < window:
+        return None
+    base = float(prev.mean())
+    if base <= 0 or math.isnan(base):
+        return None
+    return float(s.iloc[-1] / base)
+
+def freshness_filtered_features(features: Dict[str, Optional[float]],
+                                stale_keys: Set[str]) -> Dict[str, Optional[float]]:
+    filtered = dict(features)
+    for feature_key, source_keys in FEATURE_FRESHNESS_DEPENDENCIES.items():
+        if any(source_key in stale_keys for source_key in source_keys):
+            filtered[feature_key] = None
+    return filtered
+
 def piecewise_risk(x: float, points: List[Tuple[float, float]]) -> float:
     points = sorted(points)
     if x <= points[0][0]:
@@ -283,13 +346,24 @@ class DataHub:
     def _normalise_series(s: pd.Series) -> pd.Series:
         s = pd.Series(s).copy()
         try:
-            s.index = pd.to_datetime(s.index)
-            if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
-                s.index = s.index.tz_convert(None)
-            s = s[~s.index.duplicated(keep="last")].sort_index()
+            idx = pd.to_datetime(s.index, errors="coerce")
+            if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
+                idx = idx.tz_localize(None)
+            if isinstance(idx, pd.DatetimeIndex):
+                valid = ~idx.isna()
+                s = s.loc[valid]
+                s.index = idx[valid]
+                s = s[~s.index.duplicated(keep="last")].sort_index()
         except Exception:
             pass
         return pd.to_numeric(s, errors="coerce").dropna()
+
+    @staticmethod
+    def _normalise_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        return ts
 
     def add(self, key: str, s: pd.Series, source: str, note: str = "",
             merge: bool = False, prefer_new: bool = True,
@@ -398,16 +472,25 @@ class DataHub:
             return MAX_AGE_DAYS["ak_macro"]
         return MAX_AGE_DAYS["market"]
 
+    @classmethod
+    def _age_days(cls, last_date: pd.Timestamp, source: str,
+                  now: Optional[pd.Timestamp] = None) -> int:
+        now = pd.Timestamp.now().normalize() if now is None else pd.Timestamp(now).normalize()
+        last = cls._normalise_timestamp(last_date).normalize()
+        if last > now:
+            return 0
+        source = source.lower()
+        if "akshare" in source and ("macro" in source or "bond" in source):
+            return int((now - last).days)
+        return max(len(pd.bdate_range(last, now)) - 1, 0)
+
     def get_stale_keys(self) -> Set[str]:
         out = set()
         now = pd.Timestamp.now().normalize()
         for key, ds in self.series.items():
             if ds.last_date is None:
                 continue
-            last = pd.Timestamp(ds.last_date)
-            if last.tzinfo is not None:
-                last = last.tz_convert(None)
-            age = (now - last.normalize()).days
+            age = self._age_days(ds.last_date, ds.source, now=now)
             if age > self._max_age_for_source(ds.source):
                 out.add(key)
         return out
@@ -678,9 +761,18 @@ class DataHub:
 
             total_amount = np.nan
             if amount_col:
-                total_amount = float(pd.to_numeric(df[amount_col], errors="coerce").sum())
+                total_amount = pd.to_numeric(df[amount_col], errors="coerce").sum(min_count=1)
 
-            now = pd.Timestamp.now().normalize()
+            now_shanghai = pd.Timestamp.now(tz="Asia/Shanghai")
+            calendar_date = now_shanghai.normalize()
+            session_date = calendar_date
+            if session_date.weekday() >= 5:
+                session_date = (session_date - pd.offsets.BDay(1)).normalize()
+            now = DataHub._normalise_timestamp(session_date)
+            turnover_ready_for_history = (
+                session_date < calendar_date or
+                (now_shanghai.hour > 15 or (now_shanghai.hour == 15 and now_shanghai.minute >= 0))
+            )
             src = source or "AKShare:stock_zh_a_spot_em"
             self.add("A_BREADTH", pd.Series([adv], index=[now]), src, merge=True)
             self.add("A_DECLINERS", pd.Series([dec], index=[now]), src, merge=True)
@@ -688,10 +780,12 @@ class DataHub:
             self.add("A_WEAK3", pd.Series([weak], index=[now]), src, merge=True)
             self.add("A_LIMIT_DOWN_APPROX", pd.Series([approx_limit_down], index=[now]), src, merge=True)
             self.add("A_LIMIT_DOWN_RATIO", pd.Series([approx_limit_down_ratio], index=[now]), src, merge=True)
-            if not math.isnan(total_amount):
-                self.add("A_TURNOVER", pd.Series([total_amount], index=[now]), src, merge=True)
+            if pd.notna(total_amount):
+                self.add("A_TURNOVER", pd.Series([float(total_amount)], index=[now]), src, merge=True)
+            if pd.notna(total_amount) and not turnover_ready_for_history:
+                self.warnings.append("A股成交额为盘中快照，已跳过写入历史以避免污染日度成交额序列。")
 
-            self._save_snapshot({
+            snapshot_row = {
                 "date": now.strftime("%Y-%m-%d"),
                 "breadth": adv,
                 "decliners": dec,
@@ -699,8 +793,10 @@ class DataHub:
                 "weak3": weak,
                 "limit_down_approx": approx_limit_down,
                 "limit_down_ratio": approx_limit_down_ratio,
-                "turnover": None if math.isnan(total_amount) else total_amount,
-            })
+            }
+            if pd.notna(total_amount) and turnover_ready_for_history:
+                snapshot_row["turnover"] = float(total_amount)
+            self._save_snapshot(snapshot_row)
 
             hist = self._load_snapshot_history()
             if not hist.empty:
@@ -716,7 +812,7 @@ class DataHub:
         if ak is None:
             return
 
-        series_list = []
+        series_map: Dict[str, pd.Series] = {}
         try:
             end = datetime.now().date()
             start = end - timedelta(days=max(90, self.history_days))
@@ -732,7 +828,7 @@ class DataHub:
                         pd.to_numeric(df[bal_col], errors="coerce").values,
                         index=pd.to_datetime(df[date_col], errors="coerce"),
                     ).dropna()
-                    series_list.append(s.rename("SH"))
+                    series_map["SH"] = s.rename("SH")
         except Exception as e:
             self.warnings.append(f"上交所融资余额获取失败: {e}")
 
@@ -747,14 +843,17 @@ class DataHub:
                             pd.to_numeric(df[bal_col], errors="coerce").values,
                             index=pd.to_datetime(df[date_col], errors="coerce"),
                         ).dropna()
-                        series_list.append(s.rename("SZ"))
+                        series_map["SZ"] = s.rename("SZ")
         except Exception as e:
             self.warnings.append(f"深市融资余额获取失败: {e}")
 
-        if series_list:
-            merged = pd.concat(series_list, axis=1).sort_index().ffill()
-            merged["TOTAL"] = merged.sum(axis=1, min_count=1)
+        if {"SH", "SZ"}.issubset(series_map):
+            merged = pd.concat([series_map["SH"], series_map["SZ"]], axis=1).sort_index().ffill()
+            merged["TOTAL"] = merged.sum(axis=1, min_count=2)
             self.add("MARGIN_BALANCE", merged["TOTAL"], "AKShare:SSE+SZ margin", merge=True)
+        elif series_map:
+            legs = "+".join(sorted(series_map))
+            self.warnings.append(f"融资余额仅获取到 {legs} 单边数据；未合成 MARGIN_BALANCE 总量。")
 
     def fetch_boj_policy(self) -> None:
         if ak is None:
@@ -788,17 +887,24 @@ class DataHub:
         now = pd.Timestamp.now().normalize()
         for key, obj in data.items():
             try:
+                if obj is None:
+                    continue
                 if isinstance(obj, (int, float)):
                     self.add(key, pd.Series([float(obj)], index=[now]), "manual", merge=True)
                 elif isinstance(obj, dict) and "value" in obj:
+                    if obj.get("value") is None:
+                        continue
                     date = pd.to_datetime(obj.get("date", now))
                     self.add(key, pd.Series([float(obj["value"])], index=[date]), "manual", merge=True)
                 elif isinstance(obj, list):
                     idx, vals = [], []
                     for row in obj:
+                        if row.get("value") is None:
+                            continue
                         idx.append(pd.to_datetime(row["date"]))
                         vals.append(float(row["value"]))
-                    self.add(key, pd.Series(vals, index=idx), "manual", merge=True)
+                    if vals:
+                        self.add(key, pd.Series(vals, index=idx), "manual", merge=True)
             except Exception as e:
                 self.warnings.append(f"手工覆盖 {key} 读取失败: {e}")
 
@@ -820,6 +926,18 @@ class DataHub:
         new = pd.DataFrame([row])
         if path.exists():
             old = pd.read_csv(path)
+            # Intraday rows deliberately omit turnover.  When a finalized row
+            # for the same session already exists, retain its closing value
+            # while refreshing breadth fields instead of replacing it with NaN.
+            if "date" in old.columns and "date" in new.columns:
+                same_date = old["date"].astype(str) == str(new.iloc[0]["date"])
+                if same_date.any():
+                    previous = old.loc[same_date].iloc[-1].to_dict()
+                    current = {
+                        key: value for key, value in row.items()
+                        if not pd.isna(value)
+                    }
+                    new = pd.DataFrame([{**previous, **current}])
             all_df = pd.concat([old, new], ignore_index=True)
             all_df = all_df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
         else:
@@ -841,10 +959,8 @@ class DataHub:
         for key, ds in self.series.items():
             if ds.last_date is None:
                 continue
-            last = pd.Timestamp(ds.last_date)
-            if last.tzinfo is not None:
-                last = last.tz_convert(None)
-            age = (now - last.normalize()).days
+            last = self._normalise_timestamp(ds.last_date)
+            age = self._age_days(last, ds.source, now=now)
             max_age = self._max_age_for_source(ds.source)
             if age > max_age:
                 out.append(f"数据可能过期: {key} 最后日期={last.date()}, 已滞后 {age} 天, 来源={ds.source}")
@@ -902,7 +1018,7 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
                                 latest(daily), None, None, None, None, None, None, None, None,
                                 f"月线样本仅 {len(frame)} 个月，至少需要35个月。")
 
-    as_of_ts = pd.Timestamp(daily.index[-1]).tz_localize(None) if pd.Timestamp(daily.index[-1]).tzinfo else pd.Timestamp(daily.index[-1])
+    as_of_ts = DataHub._normalise_timestamp(daily.index[-1])
     is_live = as_of_ts.to_period("M") == now.to_period("M")
     row = frame.iloc[-1]
     gap = float(row["gap"])
@@ -942,11 +1058,16 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
                 cross_price = float(estimate)
                 distance = float(estimate_distance)
 
-    completed_cross = False
+    confirmed_death_cross = False
+    confirmed_golden_cross = False
     if is_live and len(frame) >= 3:
-        completed_cross = float(frame["gap"].iloc[-2]) <= 0 < float(frame["gap"].iloc[-3])
+        prior_gap = float(frame["gap"].iloc[-2])
+        prior_prior_gap = float(frame["gap"].iloc[-3])
+        confirmed_death_cross = prior_gap <= 0 < prior_prior_gap
+        confirmed_golden_cross = prior_gap >= 0 > prior_prior_gap
     elif not is_live:
-        completed_cross = gap <= 0 < previous_gap
+        confirmed_death_cross = gap <= 0 < previous_gap
+        confirmed_golden_cross = gap >= 0 > previous_gap
 
     shrinking = gap > 0 and (gap < previous_gap or (slope is not None and slope < 0))
     erosion = None
@@ -954,34 +1075,46 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
         erosion = (previous_gap - gap) / previous_gap
 
     if is_live and gap <= 0 < previous_gap:
-        level, action = "DEATH_CROSS_LIVE", "SELL_NOW"
-        reason = "本月尚未收盘，但实时月线DIF已下穿DEA；按上证规则应立即按死叉处理。"
-    elif completed_cross:
-        level, action = "DEATH_CROSS_CONFIRMED", "SELL_NOW"
+        level, action = "DEATH_CROSS_LIVE", "RISK_UP"
+        reason = "本月尚未收盘，但实时月线DIF已下穿DEA；属于未确认的实时死叉。"
+    elif confirmed_death_cross:
+        level, action = "DEATH_CROSS_CONFIRMED", "RISK_UP"
         reason = "最近一个已完成月线发生DIF下穿DEA，死叉已确认。"
-    elif gap <= 0:
-        level, action = "BEARISH", "STAY_OUT"
+    elif gap < 0 and gap > previous_gap:
+        level, action = "BEARISH_RECOVERING", "RISK_UP"
+        reason = "月线DIF仍在DEA下方，但负差较上月收窄；空头结构正在修复，尚未转为多头。"
+    elif gap < 0:
+        level, action = "BEARISH", "RISK_UP"
         reason = "月线DIF仍在DEA下方，处于死叉后的空头区间。"
     elif shrinking and (
         (days_to_cross is not None and days_to_cross <= 5)
         or (distance is not None and distance <= 2.5)
         or (erosion is not None and erosion >= 0.75)
     ):
-        level, action = "PRE_DEATH_CROSS_CRITICAL", "PREPARE_SELL"
+        level, action = "PRE_DEATH_CROSS_CRITICAL", "RISK_UP"
         reason = "月线MACD正差快速收窄，按日内斜率/临界价格判断已进入死叉高危区。"
     elif shrinking and (
         (days_to_cross is not None and days_to_cross <= 15)
         or (distance is not None and distance <= 6.0)
         or (erosion is not None and erosion >= 0.45)
     ):
-        level, action = "PRE_DEATH_CROSS_WARNING", "REDUCE_RISK"
+        level, action = "PRE_DEATH_CROSS_WARNING", "RISK_UP"
         reason = "月线MACD正差持续收窄，已触发死叉提前预警。"
     elif shrinking:
-        level, action = "WATCH", "WATCH_DAILY"
+        level, action = "WATCH", "WATCH"
         reason = "月线MACD仍为多头，但正差在收窄；需逐日监控。"
+    elif is_live and gap >= 0 > previous_gap:
+        level, action = "GOLDEN_CROSS_LIVE", "RISK_DOWN"
+        reason = "本月尚未收盘，但实时月线DIF已上穿DEA；属于未确认的实时金叉。"
+    elif confirmed_golden_cross:
+        level, action = "GOLDEN_CROSS_CONFIRMED", "RISK_DOWN"
+        reason = "最近一个已完成月线发生DIF上穿DEA，金叉已确认。"
+    elif gap > 0 and gap > previous_gap:
+        level, action = "BULLISH", "RISK_DOWN"
+        reason = "月线DIF仍在DEA上方且正差继续扩大，多头结构增强。"
     else:
-        level, action = "SAFE", "NO_ACTION"
-        reason = "月线MACD未显示死叉临近。"
+        level, action = "SAFE", "NO_SIGNAL"
+        reason = "月线MACD未显示死叉临近，也未出现强化的多头扩张。"
 
     return MonthlyMACDAlert(
         index_key=index_key,
@@ -1014,6 +1147,42 @@ def build_monthly_macd_alerts(hub: DataHub) -> List[MonthlyMACDAlert]:
             alert.reason = f"指数最后日期为 {alert.as_of}，数据已过期；禁止用旧数据触发交易动作。"
         alerts.append(alert)
     return alerts
+
+def build_monthly_macd_factors(alerts: List[MonthlyMACDAlert]) -> List[FactorResult]:
+    out = []
+    for alert in alerts:
+        weight = MONTHLY_MACD_FACTOR_WEIGHTS.get(alert.index_key, 1.0)
+        name = f"{alert.index_name}月线MACD"
+        detail = f"{alert.level}: {alert.reason}"
+        if alert.level in {"MISSING", "INSUFFICIENT_HISTORY"}:
+            out.append(factor_missing(name, "月线MACD", weight, alert.source, detail))
+            continue
+        if alert.level == "DATA_STALE":
+            out.append(FactorResult(
+                name=name,
+                group="月线MACD",
+                weight=weight,
+                signal=0.0,
+                value=alert.gap,
+                detail=detail,
+                source=alert.source,
+                missing=False,
+                stale=True,
+            ))
+            continue
+        signal = MONTHLY_MACD_SIGNAL_MAP.get(alert.level)
+        out.append(FactorResult(
+            name=name,
+            group="月线MACD",
+            weight=weight,
+            signal=signal,
+            value=alert.gap,
+            detail=detail,
+            source=alert.source,
+            missing=signal is None,
+            stale=False,
+        ))
+    return out
 
 def factor_missing(name, group, weight, source="MISSING", detail="缺失") -> FactorResult:
     return FactorResult(name, group, weight, None, None, detail, source, True)
@@ -1074,26 +1243,23 @@ class FactorEngine:
         for key in ["SSE","CSI300","CSI1000","CHINEXT","STAR50"]:
             amt = h.get(key+"_INDEX_AMOUNT")
             vol = h.get(key+"_INDEX_VOLUME")
-            if amt is not None and len(amt.dropna()) >= 10:
+            if amt is not None and len(amt.dropna()) >= 21:
                 a = amt.dropna().astype(float)
-                ma20 = a.tail(20).mean()
-                f[key+"_AMOUNT_RATIO20"] = float(a.iloc[-1] / ma20) if ma20 > 0 else None
+                f[key+"_AMOUNT_RATIO20"] = previous_window_mean_ratio(a, 20)
                 f[key+"_AMOUNT_5D"] = pct_change_n(a, 5)
             else:
                 f[key+"_AMOUNT_RATIO20"] = None
                 f[key+"_AMOUNT_5D"] = None
-            if vol is not None and len(vol.dropna()) >= 10:
+            if vol is not None and len(vol.dropna()) >= 21:
                 v = vol.dropna().astype(float)
-                ma20v = v.tail(20).mean()
-                f[key+"_VOLUME_RATIO20"] = float(v.iloc[-1] / ma20v) if ma20v > 0 else None
+                f[key+"_VOLUME_RATIO20"] = previous_window_mean_ratio(v, 20)
             else:
                 f[key+"_VOLUME_RATIO20"] = None
 
         turnover_hist = h.get("A_TURNOVER_HIST")
-        if turnover_hist is not None and len(turnover_hist.dropna()) >= 10:
+        if turnover_hist is not None and len(turnover_hist.dropna()) >= 21:
             th = turnover_hist.dropna().astype(float)
-            base = th.tail(20).mean()
-            f["A_TURNOVER_MA20_RATIO"] = float(th.iloc[-1] / base) if base > 0 else None
+            f["A_TURNOVER_MA20_RATIO"] = previous_window_mean_ratio(th, 20)
         else:
             f["A_TURNOVER_MA20_RATIO"] = None
 
@@ -1381,7 +1547,7 @@ class FactorEngine:
             "中证1000成交额确认": ["CSI1000_INDEX_AMOUNT"],
             "创业板成交额确认": ["CHINEXT_INDEX_AMOUNT"],
             "科创50成交额确认": ["STAR50_INDEX_AMOUNT"],
-            "A股成交额/MA20": ["A_TURNOVER_HIST"],
+            "A股成交额/MA20": ["A_TURNOVER", "A_TURNOVER_HIST"],
             "融资余额变化": ["MARGIN_BALANCE"],
             "主要宽基ETF 5日净流入": ["ETF_FLOW_5D_BN"],
             "IF基差": ["IF_BASIS_PCT"],
@@ -1394,8 +1560,12 @@ class FactorEngine:
 
         return R
 
-def compute_resonance(f: Dict[str, Optional[float]]) -> Tuple[float, List[str]]:
+def compute_resonance(f: Dict[str, Optional[float]],
+                      monthly_macd_alerts: Optional[List[MonthlyMACDAlert]] = None,
+                      stale_keys: Optional[Set[str]] = None) -> Tuple[float, List[str]]:
     adj, notes = 0.0, []
+    stale_keys = stale_keys or set()
+    f = freshness_filtered_features(f, stale_keys)
     us10_20, dxy5, cnh5 = f.get("US10Y_20D_BP"), f.get("DXY_5D"), f.get("USDCNH_5D")
     real10, vix = f.get("US10Y_REAL"), f.get("VIX")
     hstech1, sox1 = f.get("HSTECH_1D"), f.get("SOX_1D")
@@ -1417,55 +1587,35 @@ def compute_resonance(f: Dict[str, Optional[float]]) -> Tuple[float, List[str]]:
         adj -= 7; notes.append("绿色共振：美债快速下行 + 美元走弱 + 人民币升值。")
     if hs5 is not None and hs5 >= 5 and breadth is not None and breadth >= 0.60 and turnover is not None and turnover >= 1.20 and csi5 is not None and csi5 > 0:
         adj -= 7; notes.append("绿色共振：恒生科技强 + A股宽度>60% + 放量 + 沪深300上涨。")
-    return float(adj), notes
+    bearish_indexes = {
+        alert.index_key for alert in (monthly_macd_alerts or [])
+        if alert.index_key in MACD_INDEX_KEYS
+        and alert.index_key not in stale_keys
+        and alert.level in MONTHLY_MACD_BEARISH_LEVELS
+    }
+    bearish_count = len(bearish_indexes)
+    if bearish_count >= 4:
+        adj += 5; notes.append("月线MACD共振：5个核心指数中至少4个处于死叉/空头状态。")
+    elif bearish_count >= 3:
+        adj += 3; notes.append("月线MACD共振：5个核心指数中至少3个处于死叉/空头状态。")
+    return float(np.clip(adj, -12, 12)), notes
 
 def rule_decision_tree(buy: float, sell: float, confidence: float,
                        missing_critical: List[str],
-                       f: Dict[str, Optional[float]],
-                       monthly_macd_alerts: Optional[List[MonthlyMACDAlert]] = None) -> Tuple[str, List[str]]:
+                       stale_critical: List[str],
+                       f: Dict[str, Optional[float]]) -> Tuple[str, List[str]]:
     path = []
-    sse_macd = next(
-        (x for x in (monthly_macd_alerts or []) if x.index_key == "SSE"), None
-    )
-    # The user's explicit risk rule has priority over the composite score. The
-    # current partial month is evaluated every day, so this does not wait for a
-    # month-end bar to close.
-    if sse_macd and sse_macd.level in {"DEATH_CROSS_LIVE", "DEATH_CROSS_CONFIRMED"}:
-        path.append(f"上证指数月线MACD={sse_macd.level} -> 坚决卖出（最高优先级）")
-        return "SELL / 上证月线MACD死叉", path
-    if sse_macd and sse_macd.level == "BEARISH":
-        path.append("上证指数月线DIF仍在DEA下方 -> 保持风险规避")
-        return "RISK_OFF / 上证月线MACD空头区间", path
-    if sse_macd and sse_macd.level == "PRE_DEATH_CROSS_CRITICAL":
-        path.append("上证指数月线MACD死叉高危预警 -> 提前准备卖出/降低仓位")
-        return "PREPARE_SELL / 上证月线MACD高危", path
-    if sse_macd and sse_macd.level == "PRE_DEATH_CROSS_WARNING":
-        path.append("上证指数月线MACD死叉提前预警 -> 暂停新增仓位并准备减仓")
-        return "MACD_WARNING / 暂停加仓，准备减仓", path
-    if sse_macd and sse_macd.level == "WATCH":
-        path.append("上证指数月线MACD正差收窄 -> 每个交易日跟踪")
-
-    if confidence < 65 or len(missing_critical) >= 3:
-        path.append(f"数据置信度={confidence:.1f}，或关键数据缺失过多 -> DATA_INCOMPLETE")
+    unavailable_critical = sorted(set(missing_critical) | set(stale_critical))
+    if confidence < 65 or len(unavailable_critical) >= 3:
+        path.append(f"数据置信度={confidence:.1f}，或关键数据不可用过多 -> DATA_INCOMPLETE")
         return "DATA_INCOMPLETE / 不根据信号交易", path
-
-    vix, cnh5 = f.get("VIX"), f.get("USDCNH_5D")
-    real10, us10_20 = f.get("US10Y_REAL"), f.get("US10Y_20D_BP")
-    breadth, turnover = f.get("A_BREADTH"), f.get("A_TURNOVER_MA20_RATIO")
-
-    if vix is not None and vix >= 30 and cnh5 is not None and cnh5 >= 1.0:
-        path.append("VIX>=30 且 CNH 5日贬值>=1% -> 强风险规避")
-        return "RISK_OFF / 显著降低仓位", path
-
-    if real10 is not None and real10 >= 2.0 and us10_20 is not None and us10_20 >= 40 and cnh5 is not None and cnh5 >= 1.0:
-        path.append("实际利率>=2% + 10Y美债20日+40bp + CNH走弱 -> 利率/汇率三杀")
-        return "REDUCE / 偏卖出", path
+    breadth = f.get("A_BREADTH")
 
     if sell >= 68:
         path.append(f"综合卖出分={sell:.1f}>=68 -> 偏卖出")
         return "REDUCE / 偏卖出", path
 
-    if buy >= 65 and breadth is not None and breadth >= 0.60 and (turnover is None or turnover >= 0.9):
+    if buy >= 65 and breadth is not None and breadth >= 0.60:
         path.append(f"买入分={buy:.1f}>=65 + 市场宽度>=60% -> 偏买入")
         return "BUY_BIAS / 分批偏买入", path
 
@@ -1480,23 +1630,25 @@ def score_engine(factors: List[FactorResult],
                  features: Dict[str, Optional[float]],
                  hub: DataHub,
                  monthly_macd_alerts: Optional[List[MonthlyMACDAlert]] = None) -> EngineResult:
-    valid = [x for x in factors if not x.missing and x.signal is not None]
+    valid = [x for x in factors if not x.missing and not x.stale and x.signal is not None]
     total_weight = sum(x.weight for x in factors)
     valid_weight = sum(x.weight for x in valid)
 
     base_risk = 50.0 if valid_weight <= 0 else (
         50.0 + 50.0 * sum(x.weight*x.signal for x in valid) / valid_weight
     )
-    resonance, resonance_notes = compute_resonance(features)
+    stale_keys_set = hub.get_stale_keys()
+    fresh_features = freshness_filtered_features(features, stale_keys_set)
+    resonance, resonance_notes = compute_resonance(fresh_features, monthly_macd_alerts, stale_keys_set)
     risk = float(np.clip(base_risk + resonance, 0, 100))
     sell, buy = risk, 100.0-risk
 
     weight_coverage = valid_weight / total_weight if total_weight else 0
     missing_critical = [k for k in sorted(CRITICAL_KEYS) if features.get(k) is None]
-    stale_keys_set = hub.get_stale_keys()
     stale_critical = [k for k in sorted(CRITICAL_KEYS) if k in stale_keys_set and features.get(k) is not None]
     stale_keys = sorted(stale_keys_set)
-    critical_coverage = 1.0 - (len(missing_critical) + 0.5 * len(stale_critical)) / len(CRITICAL_KEYS)
+    unavailable_critical = sorted(set(missing_critical) | set(stale_critical))
+    critical_coverage = 1.0 - len(unavailable_critical) / len(CRITICAL_KEYS)
     critical_coverage = float(np.clip(critical_coverage, 0, 1))
     confidence = float(np.clip(100.0*(0.65*weight_coverage + 0.35*critical_coverage), 0, 100))
 
@@ -1508,7 +1660,7 @@ def score_engine(factors: List[FactorResult],
 
     monthly_macd_alerts = monthly_macd_alerts or []
     action, path = rule_decision_tree(
-        buy, sell, confidence, missing_critical, features, monthly_macd_alerts
+        buy, sell, confidence, missing_critical, stale_critical, fresh_features
     )
     path = resonance_notes + path
 
@@ -1543,39 +1695,24 @@ def decision_tree_dot() -> str:
     node [shape=box, style="rounded", fontname="Microsoft YaHei"];
     edge [fontname="Microsoft YaHei"];
 
-    M [label="上证月线MACD\n实时/确认死叉?"];
-    MS [label="SELL\n上证月线MACD死叉"];
-    W [label="上证月线MACD\n高危/提前预警?"];
-    MW [label="PREPARE_SELL / MACD_WARNING"];
-    A [label="数据置信度 >= 65% 且关键缺失 < 3?"];
+    A [label="数据置信度 >= 65%\n且关键不可用 < 3?"];
     B [label="DATA_INCOMPLETE\n不根据信号交易"];
-    C [label="VIX >= 30 且\nCNH 5日贬值 >= 1% ?"];
-    D [label="RISK_OFF\n显著降低仓位"];
-    E [label="实际利率 >= 2%\n且10Y 20日 +40bp\n且CNH 5日贬值 >=1% ?"];
-    F [label="REDUCE\n偏卖出"];
-    G [label="卖出分 >= 68 ?"];
-    H [label="买入分 >=65\n且上涨家数 >=60% ?"];
-    I [label="BUY_BIAS\n分批偏买入"];
-    J [label="买入分 >=60 ?"];
-    K [label="WATCH_BUY\n观察偏多"];
-    L [label="HOLD\n中性等待"];
+    C [label="卖出分 >= 68 ?"];
+    D [label="REDUCE\n偏卖出"];
+    E [label="买入分 >=65 且\n上涨家数 >=60% ?"];
+    F [label="BUY_BIAS\n分批偏买入"];
+    G [label="买入分 >=60 ?"];
+    H [label="WATCH_BUY\n观察偏多"];
+    I [label="HOLD\n中性等待"];
 
-    M -> MS [label="是"];
-    M -> W [label="否"];
-    W -> MW [label="是"];
-    W -> A [label="否"];
     A -> B [label="否"];
     A -> C [label="是"];
     C -> D [label="是"];
     C -> E [label="否"];
     E -> F [label="是"];
     E -> G [label="否"];
-    G -> F [label="是"];
-    G -> H [label="否"];
-    H -> I [label="是"];
-    H -> J [label="否"];
-    J -> K [label="是"];
-    J -> L [label="否"];
+    G -> H [label="是"];
+    G -> I [label="否"];
 }"""
 
 def save_decision_tree() -> Tuple[Path, Optional[Path]]:
@@ -1617,10 +1754,7 @@ def data_source_health_dataframe(hub: DataHub) -> pd.DataFrame:
         last_date = ds.last_date
         age_days = None
         if last_date is not None:
-            last = pd.Timestamp(last_date)
-            if last.tzinfo is not None:
-                last = last.tz_convert(None)
-            age_days = int((now - last.normalize()).days)
+            age_days = DataHub._age_days(last_date, ds.source, now=now)
         rows.append({
             "key": key,
             "source_chain": ds.source,
@@ -1734,6 +1868,7 @@ def run(history_days: int = DEFAULT_HISTORY_DAYS, no_live: bool = False) -> Engi
     features = fe.build_features()
     factors = fe.evaluate()
     monthly_macd_alerts = build_monthly_macd_alerts(hub)
+    factors.extend(build_monthly_macd_factors(monthly_macd_alerts))
     result = score_engine(factors, features, hub, monthly_macd_alerts)
     print_console(result)
     save_outputs(result, features, hub)
@@ -1745,10 +1880,10 @@ def build_manual_template() -> None:
         return
     today = datetime.now().date().isoformat()
     template = {
-        "ETF_FLOW_5D_BN": {"value": 0, "date": today},
-        "IF_BASIS_PCT": {"value": 0, "date": today},
-        "IC_BASIS_PCT": {"value": 0, "date": today},
-        "IM_BASIS_PCT": {"value": 0, "date": today}
+        "ETF_FLOW_5D_BN": {"value": None, "date": today},
+        "IF_BASIS_PCT": {"value": None, "date": today},
+        "IC_BASIS_PCT": {"value": None, "date": today},
+        "IM_BASIS_PCT": {"value": None, "date": today}
     }
     MANUAL_FILE.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已生成 {MANUAL_FILE}")

@@ -59,9 +59,9 @@ python a_share_risk_engine.py
 
 程序会区分：
 - `missing`：数据缺失（无值）
-- `stale`：数据存在但超出最大允许滞后天数（会告警并下调置信度）
+- `stale`：数据存在但超出最大允许滞后天数（会告警、降低置信度，并从评分/共振中排除）
 
-## 月线 MACD 实时与死叉提前预警
+## 月线 MACD 实时预警与因子化评分
 
 监控指数：上证指数、沪深300、中证1000、创业板指、科创50。
 
@@ -80,10 +80,34 @@ MACD 使用标准月线参数 `12/26/9`。最后一根月线不是等到月末�
 - `PRE_DEATH_CROSS_CRITICAL`：尚未死叉，但预计不超过 5 个交易日、距离临界价不超过 2.5%，或正差已收窄至少 75%
 - `PRE_DEATH_CROSS_WARNING`：预计不超过 15 个交易日、距离临界价不超过 6%，或正差已收窄至少 45%
 - `WATCH`：正差正在收窄
+- `GOLDEN_CROSS_LIVE`：本月未收盘，但实时月线已金叉
+- `GOLDEN_CROSS_CONFIRMED`：最近已完成月线确认金叉
+- `BULLISH`：金叉后/多头扩张区间
 - `BEARISH`：死叉后的空头区间
-- `SAFE`：暂未临近死叉
+- `BEARISH_RECOVERING`：DIF 仍低于 DEA，但负差较上月收窄，空头结构正在修复
+- `SAFE`：暂未临近死叉，也未形成更强多头扩张
 
-上证指数规则具有最高优先级：`DEATH_CROSS_LIVE`/`DEATH_CROSS_CONFIRMED` 直接输出 `SELL`，不会被综合评分或低置信度覆盖；高危和预警会分别输出准备卖出、暂停加仓/准备减仓。若指数数据过期，则输出 `DATA_STALE`，不会用旧行情触发交易动作。
+这些月线 MACD 告警不会直接变成顶层 `SELL` / `RISK_OFF` 指令，而是先转成标准风险因子并进入总分：
+
+- 上证：权重 `8.0`
+- 沪深300：权重 `4.0`
+- 中证1000 / 创业板 / 科创50：各 `2.0`
+
+信号映射（`+` 为增风险，`-` 为降风险）：
+
+- `DEATH_CROSS_CONFIRMED`=`+1.00`
+- `DEATH_CROSS_LIVE`=`+0.80`
+- `BEARISH`=`+0.55`
+- `BEARISH_RECOVERING`=`+0.20`
+- `PRE_DEATH_CROSS_CRITICAL`=`+0.50`
+- `PRE_DEATH_CROSS_WARNING`=`+0.30`
+- `WATCH`=`+0.10`
+- `SAFE`=`0.00`
+- `BULLISH`=`-0.20`
+- `GOLDEN_CROSS_LIVE`=`-0.50`
+- `GOLDEN_CROSS_CONFIRMED`=`-0.75`
+
+若月线 MACD 数据缺失/历史不足，则该因子记为 missing；若数据 stale，则记为 stale 因子并完全排除，不参与评分或共振。
 
 要做到“及时”，程序仍需在每个交易日收盘后运行一次；算法提前预警不能替代调度器。Windows 任务计划程序或 CI 定时任务均可执行：
 
@@ -108,6 +132,7 @@ python a_share_risk_engine.py
 - 跌停股占全部A股比例、强弱扩散差
 - A股上涨家数比例
 - 多市场共振
+- 核心A股指数的月线 MACD 因子与多指数共振
 
 ## 第一次运行
 
@@ -125,6 +150,8 @@ python a_share_risk_engine.py --make-manual-template
 - IF_BASIS_PCT
 - IC_BASIS_PCT
 - IM_BASIS_PCT
+
+可选手工数据若暂时没有，请保留为 `null`，程序会跳过，不会把 `0` 当成真实中性值。
 
 ## 重要
 

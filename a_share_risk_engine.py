@@ -160,6 +160,21 @@ MONTHLY_MACD_BEARISH_LEVELS = {
     "DEATH_CROSS_CONFIRMED",
     "BEARISH",
 }
+FEATURE_FRESHNESS_DEPENDENCIES = {
+    "US10Y_20D_BP": ["US10Y"],
+    "DXY_5D": ["DXY"],
+    "USDCNH_5D": ["USDCNH"],
+    "US10Y_REAL": ["US10Y_REAL"],
+    "VIX": ["VIX"],
+    "HSTECH_1D": ["HSTECH"],
+    "SOX_1D": ["SOX"],
+    "USDJPY_5D": ["USDJPY"],
+    "NIKKEI_5D": ["NIKKEI"],
+    "A_BREADTH": ["A_BREADTH"],
+    "A_TURNOVER_MA20_RATIO": ["A_TURNOVER_HIST"],
+    "HSTECH_5D": ["HSTECH"],
+    "CSI300_5D": ["CSI300"],
+}
 
 @dataclass
 class DataSeries:
@@ -285,6 +300,14 @@ def previous_window_mean_ratio(s: Optional[pd.Series], window: int = 20) -> Opti
     if base <= 0 or math.isnan(base):
         return None
     return float(s.iloc[-1] / base)
+
+def freshness_filtered_features(features: Dict[str, Optional[float]],
+                                stale_keys: Set[str]) -> Dict[str, Optional[float]]:
+    filtered = dict(features)
+    for feature_key, source_keys in FEATURE_FRESHNESS_DEPENDENCIES.items():
+        if any(source_key in stale_keys for source_key in source_keys):
+            filtered[feature_key] = None
+    return filtered
 
 def piecewise_risk(x: float, points: List[Tuple[float, float]]) -> float:
     points = sorted(points)
@@ -1527,6 +1550,7 @@ def compute_resonance(f: Dict[str, Optional[float]],
                       stale_keys: Optional[Set[str]] = None) -> Tuple[float, List[str]]:
     adj, notes = 0.0, []
     stale_keys = stale_keys or set()
+    f = freshness_filtered_features(f, stale_keys)
     us10_20, dxy5, cnh5 = f.get("US10Y_20D_BP"), f.get("DXY_5D"), f.get("USDCNH_5D")
     real10, vix = f.get("US10Y_REAL"), f.get("VIX")
     hstech1, sox1 = f.get("HSTECH_1D"), f.get("SOX_1D")
@@ -1534,22 +1558,19 @@ def compute_resonance(f: Dict[str, Optional[float]],
     breadth, turnover = f.get("A_BREADTH"), f.get("A_TURNOVER_MA20_RATIO")
     hs5, csi5 = f.get("HSTECH_5D"), f.get("CSI300_5D")
 
-    def fresh(*keys: str) -> bool:
-        return all(key not in stale_keys for key in keys)
-
-    if fresh("US10Y", "DXY", "USDCNH") and us10_20 is not None and us10_20 >= 40 and dxy5 is not None and dxy5 >= 1.0 and cnh5 is not None and cnh5 >= 1.0:
+    if us10_20 is not None and us10_20 >= 40 and dxy5 is not None and dxy5 >= 1.0 and cnh5 is not None and cnh5 >= 1.0:
         adj += 8; notes.append("红色共振：10Y美债20日+40bp以上 + DXY走强 + CNH贬值。")
-    if fresh("US10Y_REAL", "USDCNH", "VIX") and real10 is not None and real10 >= 2.0 and cnh5 is not None and cnh5 >= 1.0 and vix is not None and vix >= 25:
+    if real10 is not None and real10 >= 2.0 and cnh5 is not None and cnh5 >= 1.0 and vix is not None and vix >= 25:
         adj += 7; notes.append("红色共振：实际利率>=2% + CNH一周明显走弱 + VIX>=25。")
-    if fresh("VIX", "HSTECH", "SOX") and vix is not None and vix >= 25 and hstech1 is not None and hstech1 <= -3 and sox1 is not None and sox1 <= -3:
+    if vix is not None and vix >= 25 and hstech1 is not None and hstech1 <= -3 and sox1 is not None and sox1 <= -3:
         adj += 7; notes.append("红色共振：VIX>=25 + 恒生科技单日<-3% + SOX单日<-3%。")
-    if fresh("USDJPY", "NIKKEI") and jpy5 is not None and jpy5 <= -4 and nik5 is not None and nik5 <= -5:
+    if jpy5 is not None and jpy5 <= -4 and nik5 is not None and nik5 <= -5:
         adj += 6; notes.append("红色共振：5日日元快速升值 + 日经大跌。")
-    if fresh("A_BREADTH", "A_TURNOVER", "A_TURNOVER_HIST") and breadth is not None and breadth < 0.30 and turnover is not None and turnover >= 1.20:
+    if breadth is not None and breadth < 0.30 and turnover is not None and turnover >= 1.20:
         adj += 6; notes.append("内部确认：上涨家数<30% 且成交额>=MA20×1.2。")
-    if fresh("US10Y", "DXY", "USDCNH") and us10_20 is not None and us10_20 <= -30 and dxy5 is not None and dxy5 <= -1.0 and cnh5 is not None and cnh5 <= -1.0:
+    if us10_20 is not None and us10_20 <= -30 and dxy5 is not None and dxy5 <= -1.0 and cnh5 is not None and cnh5 <= -1.0:
         adj -= 7; notes.append("绿色共振：美债快速下行 + 美元走弱 + 人民币升值。")
-    if fresh("HSTECH", "A_BREADTH", "A_TURNOVER", "A_TURNOVER_HIST", "CSI300") and hs5 is not None and hs5 >= 5 and breadth is not None and breadth >= 0.60 and turnover is not None and turnover >= 1.20 and csi5 is not None and csi5 > 0:
+    if hs5 is not None and hs5 >= 5 and breadth is not None and breadth >= 0.60 and turnover is not None and turnover >= 1.20 and csi5 is not None and csi5 > 0:
         adj -= 7; notes.append("绿色共振：恒生科技强 + A股宽度>60% + 放量 + 沪深300上涨。")
     bearish_indexes = {
         alert.index_key for alert in (monthly_macd_alerts or [])
@@ -1567,14 +1588,13 @@ def compute_resonance(f: Dict[str, Optional[float]],
 def rule_decision_tree(buy: float, sell: float, confidence: float,
                        missing_critical: List[str],
                        stale_critical: List[str],
-                       stale_keys: Set[str],
                        f: Dict[str, Optional[float]]) -> Tuple[str, List[str]]:
     path = []
     unavailable_critical = sorted(set(missing_critical) | set(stale_critical))
     if confidence < 65 or len(unavailable_critical) >= 3:
         path.append(f"数据置信度={confidence:.1f}，或关键数据不可用过多 -> DATA_INCOMPLETE")
         return "DATA_INCOMPLETE / 不根据信号交易", path
-    breadth = None if "A_BREADTH" in stale_keys else f.get("A_BREADTH")
+    breadth = f.get("A_BREADTH")
 
     if sell >= 68:
         path.append(f"综合卖出分={sell:.1f}>=68 -> 偏卖出")
@@ -1603,7 +1623,8 @@ def score_engine(factors: List[FactorResult],
         50.0 + 50.0 * sum(x.weight*x.signal for x in valid) / valid_weight
     )
     stale_keys_set = hub.get_stale_keys()
-    resonance, resonance_notes = compute_resonance(features, monthly_macd_alerts, stale_keys_set)
+    fresh_features = freshness_filtered_features(features, stale_keys_set)
+    resonance, resonance_notes = compute_resonance(fresh_features, monthly_macd_alerts, stale_keys_set)
     risk = float(np.clip(base_risk + resonance, 0, 100))
     sell, buy = risk, 100.0-risk
 
@@ -1624,7 +1645,7 @@ def score_engine(factors: List[FactorResult],
 
     monthly_macd_alerts = monthly_macd_alerts or []
     action, path = rule_decision_tree(
-        buy, sell, confidence, missing_critical, stale_critical, stale_keys_set, features
+        buy, sell, confidence, missing_critical, stale_critical, fresh_features
     )
     path = resonance_notes + path
 

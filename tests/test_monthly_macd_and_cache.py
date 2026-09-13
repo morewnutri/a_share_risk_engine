@@ -145,6 +145,36 @@ class MonthlyMACDTests(unittest.TestCase):
         self.assertEqual("RISK_UP", recovering.action)
         self.assertEqual(0.20, factor.signal)
 
+    def test_live_golden_cross_overrides_previous_confirmed_death_cross(self):
+        now = pd.Timestamp.now().normalize()
+        frame_index = pd.date_range(
+            end=now,
+            periods=36,
+            freq=pd.offsets.MonthEnd(),
+        )
+        gaps = np.zeros(36)
+        gaps[-3:] = [0.20, -0.10, 0.05]
+        frame = pd.DataFrame({
+            "close": np.full(36, 100.0),
+            "dif": gaps,
+            "dea": np.zeros(36),
+            "gap": gaps,
+        }, index=frame_index)
+        daily = pd.Series([100.0], index=[now])
+
+        with patch.object(eng, "_monthly_macd_frame", return_value=frame):
+            alert = eng.evaluate_monthly_macd("SSE", daily, "synthetic", now=now)
+
+        self.assertEqual("GOLDEN_CROSS_LIVE", alert.level)
+        self.assertEqual("RISK_DOWN", alert.action)
+
+    def test_high_sell_score_has_distinct_risk_off_action(self):
+        risk_off, _ = eng.rule_decision_tree(5.0, 95.0, 100.0, [], [], {})
+        reduce, _ = eng.rule_decision_tree(31.0, 69.0, 100.0, [], [], {})
+
+        self.assertEqual("RISK_OFF / 显著降低仓位", risk_off)
+        self.assertEqual("REDUCE / 偏卖出", reduce)
+
     def test_stale_factor_does_not_affect_score(self):
         factors = [
             eng.FactorResult("fresh_bull", "test", 100.0, -1.0, 1.0, "", "test"),

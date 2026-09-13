@@ -51,6 +51,7 @@ python a_share_risk_engine.py
 
 - A股指数/成交额：`AKShare:stock_zh_index_daily_em` 为主，`AKShare:index_zh_a_hist` 为接口级回退，`baostock:query_history_k_data_plus` 独立拉取并补齐缺失日期
 - A股横截面宽度：优先 `AKShare:stock_zh_a_spot_em`，失败时回退 `AKShare:stock_zh_a_spot`
+- A股 freshness 和横截面快照日期：使用 `exchange-calendars` 的上交所（XSHG）真实交易日历；依赖不可用时回退到工作日口径
 - 海外市场/汇率/商品：`yfinance`，并对 HSTECH/A50 使用多 ticker 回退链
 - 美债/信用/Fed：优先 `FRED API`；未配置 `FRED_API_KEY` 时自动使用 `FRED public CSV`
 - 所有成功序列都会落入 `state/series_cache`；下次先加载缓存，再由实时源覆盖同日值。短暂断网或单个接口失效不会把历史清空
@@ -133,6 +134,12 @@ python a_share_risk_engine.py
 - A股上涨家数比例
 - 多市场共振
 - 核心A股指数的月线 MACD 因子与多指数共振
+
+综合动作分层：
+
+- `sell >= 75`：`RISK_OFF / 显著降低仓位`
+- `68 <= sell < 75`：`REDUCE / 偏卖出`
+- 其余动作继续结合买入分、市场宽度和数据置信度判断
 
 ## 第一次运行
 

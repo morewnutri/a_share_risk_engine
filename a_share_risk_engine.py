@@ -50,6 +50,11 @@ try:
 except Exception:
     bs = None
 
+try:
+    import exchange_calendars as xcals
+except Exception:
+    xcals = None
+
 DEFAULT_HISTORY_DAYS = 220
 MACD_HISTORY_DAYS = 3650
 STATE_DIR = Path("state")
@@ -177,6 +182,26 @@ FEATURE_FRESHNESS_DEPENDENCIES = {
     "HSTECH_5D": ["HSTECH"],
     "CSI300_5D": ["CSI300"],
 }
+A_SHARE_CALENDAR_KEYS = {
+    "SSE", "CSI300", "CSI1000", "CHINEXT", "STAR50",
+    "A_BREADTH", "A_DECLINERS", "A_STRONG3", "A_WEAK3",
+    "A_LIMIT_DOWN_APPROX", "A_LIMIT_DOWN_RATIO", "A_TURNOVER",
+    "A_BREADTH_HIST", "A_TURNOVER_HIST", "MARGIN_BALANCE",
+    "CSI300_INDEX_AMOUNT", "CSI1000_INDEX_AMOUNT",
+    "CHINEXT_INDEX_AMOUNT", "STAR50_INDEX_AMOUNT",
+}
+_XSHG_CALENDAR = None
+
+
+def get_xshg_calendar():
+    """Return the exchange calendar lazily; callers retain a weekday fallback."""
+    global _XSHG_CALENDAR
+    if _XSHG_CALENDAR is None and xcals is not None:
+        try:
+            _XSHG_CALENDAR = xcals.get_calendar("XSHG")
+        except Exception:
+            return None
+    return _XSHG_CALENDAR
 
 @dataclass
 class DataSeries:
@@ -474,7 +499,8 @@ class DataHub:
 
     @classmethod
     def _age_days(cls, last_date: pd.Timestamp, source: str,
-                  now: Optional[pd.Timestamp] = None) -> int:
+                  now: Optional[pd.Timestamp] = None,
+                  key: Optional[str] = None) -> int:
         now = pd.Timestamp.now().normalize() if now is None else pd.Timestamp(now).normalize()
         last = cls._normalise_timestamp(last_date).normalize()
         if last > now:
@@ -482,7 +508,63 @@ class DataHub:
         source = source.lower()
         if "akshare" in source and ("macro" in source or "bond" in source):
             return int((now - last).days)
+        uses_a_share_calendar = (
+            key in A_SHARE_CALENDAR_KEYS
+            or "local snapshot" in source
+            or "baostock" in source
+            or "akshare:stock_zh" in source
+            or "akshare:index_zh_a" in source
+            or "sse+sz margin" in source
+        )
+        if uses_a_share_calendar:
+            calendar = get_xshg_calendar()
+            if calendar is not None:
+                try:
+                    sessions = calendar.sessions_in_range(
+                        last + pd.Timedelta(days=1),
+                        cls._normalise_timestamp(now),
+                    )
+                    return len(sessions)
+                except Exception:
+                    pass
         return max(len(pd.bdate_range(last, now)) - 1, 0)
+
+    @classmethod
+    def _a_share_session_context(
+        cls, now_shanghai: Optional[pd.Timestamp] = None
+    ) -> Tuple[pd.Timestamp, bool]:
+        """Resolve the applicable XSHG session and whether turnover is final."""
+        if now_shanghai is None:
+            now_shanghai = pd.Timestamp.now(tz="Asia/Shanghai")
+        else:
+            now_shanghai = pd.Timestamp(now_shanghai)
+            if now_shanghai.tzinfo is None:
+                now_shanghai = now_shanghai.tz_localize("Asia/Shanghai")
+            else:
+                now_shanghai = now_shanghai.tz_convert("Asia/Shanghai")
+
+        calendar_date = now_shanghai.tz_localize(None).normalize()
+        calendar = get_xshg_calendar()
+        if calendar is not None:
+            try:
+                is_session = bool(calendar.is_session(calendar_date))
+                session_date = (
+                    calendar_date
+                    if is_session
+                    else cls._normalise_timestamp(
+                        calendar.date_to_session(calendar_date, direction="previous")
+                    ).normalize()
+                )
+                close_reached = (now_shanghai.hour, now_shanghai.minute) >= (15, 0)
+                return session_date, bool(is_session and close_reached)
+            except Exception:
+                pass
+
+        session_date = calendar_date
+        if session_date.weekday() >= 5:
+            session_date = (session_date - pd.offsets.BDay(1)).normalize()
+        close_reached = (now_shanghai.hour, now_shanghai.minute) >= (15, 0)
+        return session_date, bool(session_date == calendar_date and close_reached)
 
     def get_stale_keys(self) -> Set[str]:
         out = set()
@@ -490,7 +572,7 @@ class DataHub:
         for key, ds in self.series.items():
             if ds.last_date is None:
                 continue
-            age = self._age_days(ds.last_date, ds.source, now=now)
+            age = self._age_days(ds.last_date, ds.source, now=now, key=key)
             if age > self._max_age_for_source(ds.source):
                 out.add(key)
         return out
@@ -763,16 +845,7 @@ class DataHub:
             if amount_col:
                 total_amount = pd.to_numeric(df[amount_col], errors="coerce").sum(min_count=1)
 
-            now_shanghai = pd.Timestamp.now(tz="Asia/Shanghai")
-            calendar_date = now_shanghai.normalize()
-            session_date = calendar_date
-            if session_date.weekday() >= 5:
-                session_date = (session_date - pd.offsets.BDay(1)).normalize()
-            now = DataHub._normalise_timestamp(session_date)
-            turnover_ready_for_history = (
-                session_date < calendar_date or
-                (now_shanghai.hour > 15 or (now_shanghai.hour == 15 and now_shanghai.minute >= 0))
-            )
+            now, turnover_ready_for_history = self._a_share_session_context()
             src = source or "AKShare:stock_zh_a_spot_em"
             self.add("A_BREADTH", pd.Series([adv], index=[now]), src, merge=True)
             self.add("A_DECLINERS", pd.Series([dec], index=[now]), src, merge=True)
@@ -848,9 +921,16 @@ class DataHub:
             self.warnings.append(f"深市融资余额获取失败: {e}")
 
         if {"SH", "SZ"}.issubset(series_map):
-            merged = pd.concat([series_map["SH"], series_map["SZ"]], axis=1).sort_index().ffill()
-            merged["TOTAL"] = merged.sum(axis=1, min_count=2)
-            self.add("MARGIN_BALANCE", merged["TOTAL"], "AKShare:SSE+SZ margin", merge=True)
+            merged = pd.concat(
+                [series_map["SH"], series_map["SZ"]],
+                axis=1,
+                join="inner",
+            ).dropna().sort_index()
+            if merged.empty:
+                self.warnings.append("沪深融资余额没有共同交易日；未合成 MARGIN_BALANCE 总量。")
+            else:
+                merged["TOTAL"] = merged["SH"] + merged["SZ"]
+                self.add("MARGIN_BALANCE", merged["TOTAL"], "AKShare:SSE+SZ margin", merge=True)
         elif series_map:
             legs = "+".join(sorted(series_map))
             self.warnings.append(f"融资余额仅获取到 {legs} 单边数据；未合成 MARGIN_BALANCE 总量。")
@@ -960,7 +1040,7 @@ class DataHub:
             if ds.last_date is None:
                 continue
             last = self._normalise_timestamp(ds.last_date)
-            age = self._age_days(last, ds.source, now=now)
+            age = self._age_days(last, ds.source, now=now, key=key)
             max_age = self._max_age_for_source(ds.source)
             if age > max_age:
                 out.append(f"数据可能过期: {key} 最后日期={last.date()}, 已滞后 {age} 天, 来源={ds.source}")
@@ -1077,9 +1157,15 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
     if is_live and gap <= 0 < previous_gap:
         level, action = "DEATH_CROSS_LIVE", "RISK_UP"
         reason = "本月尚未收盘，但实时月线DIF已下穿DEA；属于未确认的实时死叉。"
+    elif is_live and gap >= 0 > previous_gap:
+        level, action = "GOLDEN_CROSS_LIVE", "RISK_DOWN"
+        reason = "本月尚未收盘，但实时月线DIF已上穿DEA；属于未确认的实时金叉。"
     elif confirmed_death_cross:
         level, action = "DEATH_CROSS_CONFIRMED", "RISK_UP"
         reason = "最近一个已完成月线发生DIF下穿DEA，死叉已确认。"
+    elif confirmed_golden_cross:
+        level, action = "GOLDEN_CROSS_CONFIRMED", "RISK_DOWN"
+        reason = "最近一个已完成月线发生DIF上穿DEA，金叉已确认。"
     elif gap < 0 and gap > previous_gap:
         level, action = "BEARISH_RECOVERING", "RISK_UP"
         reason = "月线DIF仍在DEA下方，但负差较上月收窄；空头结构正在修复，尚未转为多头。"
@@ -1103,12 +1189,6 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
     elif shrinking:
         level, action = "WATCH", "WATCH"
         reason = "月线MACD仍为多头，但正差在收窄；需逐日监控。"
-    elif is_live and gap >= 0 > previous_gap:
-        level, action = "GOLDEN_CROSS_LIVE", "RISK_DOWN"
-        reason = "本月尚未收盘，但实时月线DIF已上穿DEA；属于未确认的实时金叉。"
-    elif confirmed_golden_cross:
-        level, action = "GOLDEN_CROSS_CONFIRMED", "RISK_DOWN"
-        reason = "最近一个已完成月线发生DIF上穿DEA，金叉已确认。"
     elif gap > 0 and gap > previous_gap:
         level, action = "BULLISH", "RISK_DOWN"
         reason = "月线DIF仍在DEA上方且正差继续扩大，多头结构增强。"
@@ -1611,6 +1691,10 @@ def rule_decision_tree(buy: float, sell: float, confidence: float,
         return "DATA_INCOMPLETE / 不根据信号交易", path
     breadth = f.get("A_BREADTH")
 
+    if sell >= 75:
+        path.append(f"综合卖出分={sell:.1f}>=75 -> 显著降低仓位")
+        return "RISK_OFF / 显著降低仓位", path
+
     if sell >= 68:
         path.append(f"综合卖出分={sell:.1f}>=68 -> 偏卖出")
         return "REDUCE / 偏卖出", path
@@ -1697,14 +1781,15 @@ def decision_tree_dot() -> str:
 
     A [label="数据置信度 >= 65%\n且关键不可用 < 3?"];
     B [label="DATA_INCOMPLETE\n不根据信号交易"];
-    C [label="卖出分 >= 68 ?"];
-    D [label="REDUCE\n偏卖出"];
-    E [label="买入分 >=65 且\n上涨家数 >=60% ?"];
-    F [label="BUY_BIAS\n分批偏买入"];
-    G [label="买入分 >=60 ?"];
-    H [label="WATCH_BUY\n观察偏多"];
-    I [label="HOLD\n中性等待"];
-
+    C [label="卖出分 >= 75 ?"];
+    D [label="RISK_OFF\n显著降低仓位"];
+    E [label="卖出分 >= 68 ?"];
+    F [label="REDUCE\n偏卖出"];
+    G [label="买入分 >=65 且\n上涨家数 >=60% ?"];
+    H [label="BUY_BIAS\n分批偏买入"];
+    I [label="买入分 >=60 ?"];
+    J [label="WATCH_BUY\n观察偏多"];
+    K [label="HOLD\n中性等待"];
     A -> B [label="否"];
     A -> C [label="是"];
     C -> D [label="是"];
@@ -1713,6 +1798,8 @@ def decision_tree_dot() -> str:
     E -> G [label="否"];
     G -> H [label="是"];
     G -> I [label="否"];
+    I -> J [label="是"];
+    I -> K [label="否"];
 }"""
 
 def save_decision_tree() -> Tuple[Path, Optional[Path]]:
@@ -1754,7 +1841,7 @@ def data_source_health_dataframe(hub: DataHub) -> pd.DataFrame:
         last_date = ds.last_date
         age_days = None
         if last_date is not None:
-            age_days = DataHub._age_days(last_date, ds.source, now=now)
+            age_days = DataHub._age_days(last_date, ds.source, now=now, key=key)
         rows.append({
             "key": key,
             "source_chain": ds.source,

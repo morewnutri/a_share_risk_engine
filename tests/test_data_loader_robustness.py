@@ -159,6 +159,47 @@ class DataLoaderRobustnessTests(unittest.TestCase):
         self.assertIsNone(hub.get("MARGIN_BALANCE"))
         self.assertTrue(any("未合成 MARGIN_BALANCE" in warning for warning in hub.warnings))
 
+    def test_margin_balance_uses_only_dates_present_on_both_exchanges(self):
+        sse_margin = pd.DataFrame({
+            "信用交易日期": ["2026-09-01", "2026-09-10"],
+            "融资余额": [100.0, 110.0],
+        })
+        sz_margin = pd.DataFrame({
+            "日期": ["2026-09-01"],
+            "融资余额": [200.0],
+        })
+
+        with patch.object(
+            eng, "ak", _FakeAK(sse_margin=sse_margin, sz_margin=sz_margin)
+        ):
+            hub = eng.DataHub(history_days=30)
+            hub.fetch_margin()
+
+        margin = hub.get("MARGIN_BALANCE")
+        self.assertEqual(1, len(margin))
+        self.assertEqual(pd.Timestamp("2026-09-01"), margin.index[-1])
+        self.assertEqual(300.0, float(margin.iloc[-1]))
+
+    @unittest.skipIf(eng.xcals is None, "exchange-calendars is not installed")
+    def test_a_share_age_excludes_national_day_exchange_holiday(self):
+        age = eng.DataHub._age_days(
+            pd.Timestamp("2026-09-30"),
+            "AKShare:stock_zh_index_daily_em(sh000001)",
+            now=pd.Timestamp("2026-10-07"),
+            key="SSE",
+        )
+
+        self.assertEqual(0, age)
+
+    @unittest.skipIf(eng.xcals is None, "exchange-calendars is not installed")
+    def test_holiday_snapshot_uses_previous_session_without_finalizing_turnover(self):
+        holiday = pd.Timestamp("2026-10-05 16:00", tz="Asia/Shanghai")
+
+        session_date, turnover_ready = eng.DataHub._a_share_session_context(holiday)
+
+        self.assertEqual(pd.Timestamp("2026-09-30"), session_date)
+        self.assertFalse(turnover_ready)
+
     def test_turnover_ratio_uses_previous_20_day_average(self):
         hub = eng.DataHub(history_days=30)
         idx = pd.date_range("2026-08-01", periods=21, freq="B")

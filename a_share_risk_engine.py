@@ -1551,10 +1551,13 @@ def compute_resonance(f: Dict[str, Optional[float]],
         adj -= 7; notes.append("绿色共振：美债快速下行 + 美元走弱 + 人民币升值。")
     if fresh("HSTECH", "A_BREADTH", "A_TURNOVER", "A_TURNOVER_HIST", "CSI300") and hs5 is not None and hs5 >= 5 and breadth is not None and breadth >= 0.60 and turnover is not None and turnover >= 1.20 and csi5 is not None and csi5 > 0:
         adj -= 7; notes.append("绿色共振：恒生科技强 + A股宽度>60% + 放量 + 沪深300上涨。")
-    bearish_count = sum(
-        1 for alert in (monthly_macd_alerts or [])
-        if alert.index_key not in stale_keys and alert.level in MONTHLY_MACD_BEARISH_LEVELS
-    )
+    bearish_indexes = {
+        alert.index_key for alert in (monthly_macd_alerts or [])
+        if alert.index_key in MACD_INDEX_KEYS
+        and alert.index_key not in stale_keys
+        and alert.level in MONTHLY_MACD_BEARISH_LEVELS
+    }
+    bearish_count = len(bearish_indexes)
     if bearish_count >= 4:
         adj += 5; notes.append("月线MACD共振：5个核心指数中至少4个处于死叉/空头状态。")
     elif bearish_count >= 3:

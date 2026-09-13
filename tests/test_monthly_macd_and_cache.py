@@ -13,11 +13,19 @@ def _synthetic_monthly_series(base_values: np.ndarray, current_change: float,
                               live: bool = True) -> tuple[pd.Series, pd.Timestamp]:
     now = pd.Timestamp.now().normalize()
     if live:
-        prior_months = pd.date_range(end=now - pd.offsets.MonthEnd(1), periods=len(base_values), freq="ME")
+        prior_months = pd.date_range(
+            end=now - pd.offsets.MonthEnd(1),
+            periods=len(base_values),
+            freq=pd.offsets.MonthEnd(),
+        )
         series = pd.Series(base_values, index=prior_months)
         series.loc[now] = float(base_values[-1] + current_change)
     else:
-        month_ends = pd.date_range(end=now - pd.offsets.MonthEnd(1), periods=len(base_values), freq="ME")
+        month_ends = pd.date_range(
+            end=now - pd.offsets.MonthEnd(1),
+            periods=len(base_values),
+            freq=pd.offsets.MonthEnd(),
+        )
         series = pd.Series(base_values, index=month_ends)
         series.iloc[-1] = float(series.iloc[-1] + current_change)
     return series, now
@@ -123,6 +131,19 @@ class MonthlyMACDTests(unittest.TestCase):
         self.assertEqual("RISK_DOWN", bullish.action)
         self.assertEqual("RISK_DOWN", golden_live.action)
         self.assertEqual("RISK_DOWN", golden_confirmed.action)
+
+    def test_negative_gap_recovery_stays_bearish_with_reduced_risk(self):
+        recovering = _find_alert(
+            "BEARISH_RECOVERING",
+            np.linspace(4000.0, 2000.0, 60),
+            np.linspace(-30.0, -5.0, 6),
+        )
+        factor = eng.build_monthly_macd_factors([recovering])[0]
+
+        self.assertLess(recovering.gap, 0)
+        self.assertGreater(recovering.gap, recovering.previous_completed_gap)
+        self.assertEqual("RISK_UP", recovering.action)
+        self.assertEqual(0.20, factor.signal)
 
     def test_stale_factor_does_not_affect_score(self):
         factors = [

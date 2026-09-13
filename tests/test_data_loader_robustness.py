@@ -132,6 +132,23 @@ class DataLoaderRobustnessTests(unittest.TestCase):
 
         self.assertIsNone(hub.get("A_TURNOVER"))
 
+    def test_intraday_snapshot_does_not_replace_finalized_turnover(self):
+        hub = eng.DataHub(history_days=30)
+        hub._save_snapshot({
+            "date": "2026-09-11",
+            "breadth": 0.55,
+            "turnover": 12345.0,
+        })
+        hub._save_snapshot({
+            "date": "2026-09-11",
+            "breadth": 0.60,
+        })
+
+        history = hub._load_snapshot_history()
+        self.assertEqual(1, len(history))
+        self.assertEqual(0.60, float(history.loc[0, "breadth"]))
+        self.assertEqual(12345.0, float(history.loc[0, "turnover"]))
+
     def test_margin_balance_requires_both_legs(self):
         sse_margin = pd.DataFrame({"信用交易日期": ["2026-09-12"], "融资余额": [100.0]})
 

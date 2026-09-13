@@ -84,6 +84,7 @@ MACD 使用标准月线参数 `12/26/9`。最后一根月线不是等到月末�
 - `GOLDEN_CROSS_CONFIRMED`：最近已完成月线确认金叉
 - `BULLISH`：金叉后/多头扩张区间
 - `BEARISH`：死叉后的空头区间
+- `BEARISH_RECOVERING`：DIF 仍低于 DEA，但负差较上月收窄，空头结构正在修复
 - `SAFE`：暂未临近死叉，也未形成更强多头扩张
 
 这些月线 MACD 告警不会直接变成顶层 `SELL` / `RISK_OFF` 指令，而是先转成标准风险因子并进入总分：
@@ -97,6 +98,7 @@ MACD 使用标准月线参数 `12/26/9`。最后一根月线不是等到月末�
 - `DEATH_CROSS_CONFIRMED`=`+1.00`
 - `DEATH_CROSS_LIVE`=`+0.80`
 - `BEARISH`=`+0.55`
+- `BEARISH_RECOVERING`=`+0.20`
 - `PRE_DEATH_CROSS_CRITICAL`=`+0.50`
 - `PRE_DEATH_CROSS_WARNING`=`+0.30`
 - `WATCH`=`+0.10`

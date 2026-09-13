@@ -147,6 +147,7 @@ MONTHLY_MACD_SIGNAL_MAP = {
     "DEATH_CROSS_CONFIRMED": 1.00,
     "DEATH_CROSS_LIVE": 0.80,
     "BEARISH": 0.55,
+    "BEARISH_RECOVERING": 0.20,
     "PRE_DEATH_CROSS_CRITICAL": 0.50,
     "PRE_DEATH_CROSS_WARNING": 0.30,
     "WATCH": 0.10,
@@ -159,6 +160,7 @@ MONTHLY_MACD_BEARISH_LEVELS = {
     "DEATH_CROSS_LIVE",
     "DEATH_CROSS_CONFIRMED",
     "BEARISH",
+    "BEARISH_RECOVERING",
 }
 FEATURE_FRESHNESS_DEPENDENCIES = {
     "US10Y_20D_BP": ["US10Y"],
@@ -783,7 +785,7 @@ class DataHub:
             if pd.notna(total_amount) and not turnover_ready_for_history:
                 self.warnings.append("A股成交额为盘中快照，已跳过写入历史以避免污染日度成交额序列。")
 
-            self._save_snapshot({
+            snapshot_row = {
                 "date": now.strftime("%Y-%m-%d"),
                 "breadth": adv,
                 "decliners": dec,
@@ -791,12 +793,10 @@ class DataHub:
                 "weak3": weak,
                 "limit_down_approx": approx_limit_down,
                 "limit_down_ratio": approx_limit_down_ratio,
-                "turnover": (
-                    None
-                    if pd.isna(total_amount) or not turnover_ready_for_history
-                    else float(total_amount)
-                ),
-            })
+            }
+            if pd.notna(total_amount) and turnover_ready_for_history:
+                snapshot_row["turnover"] = float(total_amount)
+            self._save_snapshot(snapshot_row)
 
             hist = self._load_snapshot_history()
             if not hist.empty:
@@ -926,6 +926,18 @@ class DataHub:
         new = pd.DataFrame([row])
         if path.exists():
             old = pd.read_csv(path)
+            # Intraday rows deliberately omit turnover.  When a finalized row
+            # for the same session already exists, retain its closing value
+            # while refreshing breadth fields instead of replacing it with NaN.
+            if "date" in old.columns and "date" in new.columns:
+                same_date = old["date"].astype(str) == str(new.iloc[0]["date"])
+                if same_date.any():
+                    previous = old.loc[same_date].iloc[-1].to_dict()
+                    current = {
+                        key: value for key, value in row.items()
+                        if not pd.isna(value)
+                    }
+                    new = pd.DataFrame([{**previous, **current}])
             all_df = pd.concat([old, new], ignore_index=True)
             all_df = all_df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
         else:
@@ -1068,7 +1080,10 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
     elif confirmed_death_cross:
         level, action = "DEATH_CROSS_CONFIRMED", "RISK_UP"
         reason = "最近一个已完成月线发生DIF下穿DEA，死叉已确认。"
-    elif gap <= 0:
+    elif gap < 0 and gap > previous_gap:
+        level, action = "BEARISH_RECOVERING", "RISK_UP"
+        reason = "月线DIF仍在DEA下方，但负差较上月收窄；空头结构正在修复，尚未转为多头。"
+    elif gap < 0:
         level, action = "BEARISH", "RISK_UP"
         reason = "月线DIF仍在DEA下方，处于死叉后的空头区间。"
     elif shrinking and (

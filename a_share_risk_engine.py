@@ -738,10 +738,14 @@ class DataHub:
             if amount_col:
                 total_amount = pd.to_numeric(df[amount_col], errors="coerce").sum(min_count=1)
 
-            now = pd.Timestamp.now().normalize()
             now_shanghai = pd.Timestamp.now(tz="Asia/Shanghai")
+            calendar_date = now_shanghai.normalize()
+            session_date = calendar_date
+            if session_date.weekday() >= 5:
+                session_date = (session_date - pd.offsets.BDay(1)).normalize()
+            now = DataHub._normalise_timestamp(session_date)
             turnover_ready_for_history = (
-                now_shanghai.weekday() < 5 and
+                session_date < calendar_date or
                 (now_shanghai.hour > 15 or (now_shanghai.hour == 15 and now_shanghai.minute >= 0))
             )
             src = source or "AKShare:stock_zh_a_spot_em"
@@ -1568,13 +1572,12 @@ def rule_decision_tree(buy: float, sell: float, confidence: float,
         path.append(f"数据置信度={confidence:.1f}，或关键数据不可用过多 -> DATA_INCOMPLETE")
         return "DATA_INCOMPLETE / 不根据信号交易", path
     breadth = None if "A_BREADTH" in stale_keys else f.get("A_BREADTH")
-    turnover = None if {"A_TURNOVER", "A_TURNOVER_HIST"} & stale_keys else f.get("A_TURNOVER_MA20_RATIO")
 
     if sell >= 68:
         path.append(f"综合卖出分={sell:.1f}>=68 -> 偏卖出")
         return "REDUCE / 偏卖出", path
 
-    if buy >= 65 and breadth is not None and breadth >= 0.60 and (turnover is None or turnover >= 0.9):
+    if buy >= 65 and breadth is not None and breadth >= 0.60:
         path.append(f"买入分={buy:.1f}>=65 + 市场宽度>=60% -> 偏买入")
         return "BUY_BIAS / 分批偏买入", path
 
@@ -1657,7 +1660,7 @@ def decision_tree_dot() -> str:
     B [label="DATA_INCOMPLETE\n不根据信号交易"];
     C [label="卖出分 >= 68 ?"];
     D [label="REDUCE\n偏卖出"];
-    E [label="买入分 >=65 且\n上涨家数 >=60% 且\n成交额确认不弱 ?"];
+    E [label="买入分 >=65 且\n上涨家数 >=60% ?"];
     F [label="BUY_BIAS\n分批偏买入"];
     G [label="买入分 >=60 ?"];
     H [label="WATCH_BUY\n观察偏多"];

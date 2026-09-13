@@ -5,7 +5,7 @@ digraph AShareRiskTree {
     B [label="DATA_INCOMPLETE"];
     C [label="卖出分 >= 68 ?"];
     D [label="REDUCE / 偏卖出"];
-    E [label="买入分 >=65 且\n上涨家数 >=60% 且\n成交额确认不弱 ?"];
+    E [label="买入分 >=65 且\n上涨家数 >=60% ?"];
     F [label="BUY_BIAS / 分批偏买入"];
     G [label="买入分 >=60 ?"];
     H [label="WATCH_BUY"];

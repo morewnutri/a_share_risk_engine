@@ -1505,7 +1505,7 @@ class FactorEngine:
             "中证1000成交额确认": ["CSI1000_INDEX_AMOUNT"],
             "创业板成交额确认": ["CHINEXT_INDEX_AMOUNT"],
             "科创50成交额确认": ["STAR50_INDEX_AMOUNT"],
-            "A股成交额/MA20": ["A_TURNOVER_HIST"],
+            "A股成交额/MA20": ["A_TURNOVER", "A_TURNOVER_HIST"],
             "融资余额变化": ["MARGIN_BALANCE"],
             "主要宽基ETF 5日净流入": ["ETF_FLOW_5D_BN"],
             "IF基差": ["IF_BASIS_PCT"],
@@ -1541,11 +1541,11 @@ def compute_resonance(f: Dict[str, Optional[float]],
         adj += 7; notes.append("红色共振：VIX>=25 + 恒生科技单日<-3% + SOX单日<-3%。")
     if fresh("USDJPY", "NIKKEI") and jpy5 is not None and jpy5 <= -4 and nik5 is not None and nik5 <= -5:
         adj += 6; notes.append("红色共振：5日日元快速升值 + 日经大跌。")
-    if fresh("A_BREADTH", "A_TURNOVER_HIST") and breadth is not None and breadth < 0.30 and turnover is not None and turnover >= 1.20:
+    if fresh("A_BREADTH", "A_TURNOVER", "A_TURNOVER_HIST") and breadth is not None and breadth < 0.30 and turnover is not None and turnover >= 1.20:
         adj += 6; notes.append("内部确认：上涨家数<30% 且成交额>=MA20×1.2。")
     if fresh("US10Y", "DXY", "USDCNH") and us10_20 is not None and us10_20 <= -30 and dxy5 is not None and dxy5 <= -1.0 and cnh5 is not None and cnh5 <= -1.0:
         adj -= 7; notes.append("绿色共振：美债快速下行 + 美元走弱 + 人民币升值。")
-    if fresh("HSTECH", "A_BREADTH", "A_TURNOVER_HIST", "CSI300") and hs5 is not None and hs5 >= 5 and breadth is not None and breadth >= 0.60 and turnover is not None and turnover >= 1.20 and csi5 is not None and csi5 > 0:
+    if fresh("HSTECH", "A_BREADTH", "A_TURNOVER", "A_TURNOVER_HIST", "CSI300") and hs5 is not None and hs5 >= 5 and breadth is not None and breadth >= 0.60 and turnover is not None and turnover >= 1.20 and csi5 is not None and csi5 > 0:
         adj -= 7; notes.append("绿色共振：恒生科技强 + A股宽度>60% + 放量 + 沪深300上涨。")
     bearish_count = sum(
         1 for alert in (monthly_macd_alerts or [])
@@ -1560,13 +1560,15 @@ def compute_resonance(f: Dict[str, Optional[float]],
 def rule_decision_tree(buy: float, sell: float, confidence: float,
                        missing_critical: List[str],
                        stale_critical: List[str],
+                       stale_keys: Set[str],
                        f: Dict[str, Optional[float]]) -> Tuple[str, List[str]]:
     path = []
     unavailable_critical = sorted(set(missing_critical) | set(stale_critical))
     if confidence < 65 or len(unavailable_critical) >= 3:
         path.append(f"数据置信度={confidence:.1f}，或关键数据不可用过多 -> DATA_INCOMPLETE")
         return "DATA_INCOMPLETE / 不根据信号交易", path
-    breadth, turnover = f.get("A_BREADTH"), f.get("A_TURNOVER_MA20_RATIO")
+    breadth = None if "A_BREADTH" in stale_keys else f.get("A_BREADTH")
+    turnover = None if {"A_TURNOVER", "A_TURNOVER_HIST"} & stale_keys else f.get("A_TURNOVER_MA20_RATIO")
 
     if sell >= 68:
         path.append(f"综合卖出分={sell:.1f}>=68 -> 偏卖出")
@@ -1616,7 +1618,7 @@ def score_engine(factors: List[FactorResult],
 
     monthly_macd_alerts = monthly_macd_alerts or []
     action, path = rule_decision_tree(
-        buy, sell, confidence, missing_critical, stale_critical, features
+        buy, sell, confidence, missing_critical, stale_critical, stale_keys_set, features
     )
     path = resonance_notes + path
 

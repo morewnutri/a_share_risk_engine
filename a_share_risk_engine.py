@@ -987,9 +987,6 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
     elif death_cross_confirmed:
         level, action = "DEATH_CROSS_CONFIRMED", "RISK_DOWN"
         reason = "最近一个已完成月线发生DIF下穿DEA，死叉已确认。"
-    elif gap <= 0:
-        level, action = "BEARISH", "RISK_DOWN"
-        reason = "月线DIF仍在DEA下方，处于死叉后的空头区间。"
     elif is_live and gap >= 0 > previous_gap:
         level, action = "GOLDEN_CROSS_LIVE", "RISK_UP"
         reason = "本月尚未收盘，但实时月线DIF已上穿DEA；为实时金叉状态。"
@@ -999,6 +996,9 @@ def evaluate_monthly_macd(index_key: str, daily_close: Optional[pd.Series],
     elif strengthening:
         level, action = "BULLISH", "RISK_UP"
         reason = "月线DIF修复并走强，趋势偏多。"
+    elif gap <= 0:
+        level, action = "BEARISH", "RISK_DOWN"
+        reason = "月线DIF仍在DEA下方，处于死叉后的空头区间。"
     elif shrinking and (
         (days_to_cross is not None and days_to_cross <= 5)
         or (distance is not None and distance <= 2.5)
@@ -1166,15 +1166,22 @@ class FactorEngine:
                 f[key+"_VOLUME_RATIO20"] = None
 
         turnover_hist = h.get("A_TURNOVER_HIST")
+        live_turnover = latest(h.get("A_TURNOVER"))
         if turnover_hist is not None:
-            turnover_hist = turnover_hist.copy()
-            now = pd.Timestamp.now().normalize()
-            if isinstance(turnover_hist.index, pd.DatetimeIndex):
-                turnover_hist = turnover_hist[turnover_hist.index.normalize() < now]
-        if turnover_hist is not None and len(turnover_hist.dropna()) >= 21:
             th = turnover_hist.dropna().astype(float)
-            base = th.iloc[-21:-1].mean()
-            f["A_TURNOVER_MA20_RATIO"] = float(th.iloc[-1] / base) if base > 0 else None
+            now = pd.Timestamp.now().normalize()
+            if isinstance(th.index, pd.DatetimeIndex):
+                completed = th[th.index.normalize() < now]
+            else:
+                completed = th
+            ratio = None
+            if live_turnover is not None and len(completed) >= 20:
+                base = completed.iloc[-20:].mean()
+                ratio = float(live_turnover / base) if base > 0 else None
+            elif len(completed) >= 21:
+                base = completed.iloc[-21:-1].mean()
+                ratio = float(completed.iloc[-1] / base) if base > 0 else None
+            f["A_TURNOVER_MA20_RATIO"] = ratio
         else:
             f["A_TURNOVER_MA20_RATIO"] = None
 

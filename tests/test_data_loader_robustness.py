@@ -70,6 +70,23 @@ class DataLoaderRobustnessTests(unittest.TestCase):
         self.assertGreater(fresh_res.confidence, stale_res.confidence)
         self.assertTrue(stale_res.stale_critical)
         self.assertFalse(stale_res.missing_critical)
+        self.assertEqual("DATA_INCOMPLETE / 不根据信号交易", stale_res.action)
+
+    def test_stale_factors_are_excluded_from_score(self):
+        hub = eng.DataHub()
+        factors = [
+            eng.FactorResult("fresh", "g", 10.0, 0.0, 1.0, "", "manual", False, False),
+            eng.FactorResult("stale_bear", "g", 90.0, 1.0, 1.0, "", "manual", False, True),
+        ]
+        res = eng.score_engine(factors, {}, hub, [])
+        self.assertAlmostEqual(50.0, res.sell_score, places=6)
+
+    def test_resonance_ignores_stale_inputs(self):
+        features = {"US10Y_20D_BP": 50.0, "DXY_5D": 2.0, "USDCNH_5D": 2.0}
+        fresh_adj, _ = eng.compute_resonance(features, set(), [])
+        stale_adj, _ = eng.compute_resonance(features, {"US10Y_20D_BP"}, [])
+        self.assertGreater(fresh_adj, stale_adj)
+        self.assertEqual(0.0, stale_adj)
 
     def test_fred_public_csv_fallback_does_not_require_api_key(self):
         with patch.dict(eng.os.environ, {"FRED_API_KEY": ""}), \
@@ -87,6 +104,42 @@ class DataLoaderRobustnessTests(unittest.TestCase):
 
         self.assertEqual(1, len(norm))
         self.assertEqual(pd.Timestamp("2026-01-01"), norm.index[0])
+
+    def test_unparseable_turnover_does_not_create_zero_series(self):
+        class _FakeAK:
+            @staticmethod
+            def stock_zh_a_spot_em():
+                return pd.DataFrame({"涨跌幅": [1.0, -1.0], "成交额": ["--", "abc"]})
+
+        with patch.object(eng, "ak", _FakeAK()):
+            hub = eng.DataHub()
+            hub.fetch_a_share_snapshot()
+        self.assertIsNone(hub.get("A_TURNOVER"))
+
+    def test_margin_balance_requires_both_legs(self):
+        class _FakeAK:
+            @staticmethod
+            def stock_margin_sse(start_date, end_date):
+                return pd.DataFrame({
+                    "信用交易日期": ["2026-01-01", "2026-01-02"],
+                    "融资余额": [100.0, 110.0],
+                })
+
+        with patch.object(eng, "ak", _FakeAK()):
+            hub = eng.DataHub()
+            hub.fetch_margin()
+        self.assertIsNone(hub.get("MARGIN_BALANCE"))
+        self.assertTrue(any("MARGIN_BALANCE 保持缺失" in w for w in hub.warnings))
+
+    def test_turnover_ratio_uses_previous_20_day_average(self):
+        now = pd.Timestamp.now().normalize()
+        idx = pd.date_range(end=now, periods=22, freq="D")
+        vals = [100.0] * 20 + [210.0, 2000.0]
+        hub = eng.DataHub()
+        hub.add("A_TURNOVER_HIST", pd.Series(vals, index=idx), "snapshot")
+        fe = eng.FactorEngine(hub)
+        features = fe.build_features()
+        self.assertAlmostEqual(2.1, features["A_TURNOVER_MA20_RATIO"], places=6)
 
 
 if __name__ == "__main__":

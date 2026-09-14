@@ -1,8 +1,9 @@
 """Complete Google Colab runner for morewnutri/a_share_risk_engine.
 
 Copy this entire file into one fresh Colab cell and run it. Dependencies are
-installed into a repository-local virtual environment so the notebook kernel's
-preloaded NumPy/pandas binaries are never replaced in place.
+installed into a repository-local target directory so the notebook kernel's
+preloaded NumPy/pandas binaries are never replaced in place. This also avoids
+depending on ``venv``/``ensurepip``, which is unavailable in some Colab images.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/morewnutri/a_share_risk_engine.git"
 REPO_DIR = Path("/content/a_share_risk_engine")
-VENV_DIR = REPO_DIR / ".venv"
+DEPS_DIR = REPO_DIR / ".deps"
 BRANCH = "main"
 FRED_API_KEY = ""  # Optional; blank uses the official public FRED CSV.
 
@@ -71,23 +72,55 @@ if REPO_DIR.exists():
 
 run(["git", "clone", "--depth", "1", "--branch", BRANCH, REPO_URL, str(REPO_DIR)])
 
+# Older remote revisions pin NumPy below 2, which is incompatible with the
+# current Python 3.13 Colab image. Normalize only that requirement so this
+# runner remains usable before the repository-side fix is merged.
+requirements_path = REPO_DIR / "requirements.txt"
+requirement_lines = requirements_path.read_text(encoding="utf-8").splitlines()
+normalized_lines = [
+    "numpy>=1.26.4" if line.strip().lower().startswith("numpy") else line
+    for line in requirement_lines
+]
+if normalized_lines != requirement_lines:
+    requirements_path.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
+    print("Adjusted the cloned NumPy requirement for Colab compatibility.")
 
-# ---------- 2. Install into an isolated environment ----------
-run([sys.executable, "-m", "venv", str(VENV_DIR)])
-venv_python = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-run([str(venv_python), "-m", "pip", "install", "-q", "--upgrade", "pip"])
+
+# ---------- 2. Install into an isolated dependency directory ----------
+# ``pip --target`` leaves the kernel packages alone and does not need the
+# stdlib ``venv`` module's ensurepip bootstrap.
 run(
-    [str(venv_python), "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-q",
+        "--no-cache-dir",
+        "--upgrade",
+        "--ignore-installed",
+        "--target",
+        str(DEPS_DIR),
+        "-r",
+        "requirements.txt",
+    ],
     cwd=REPO_DIR,
+)
+
+isolated_env = os.environ.copy()
+existing_pythonpath = isolated_env.get("PYTHONPATH")
+isolated_env["PYTHONPATH"] = str(DEPS_DIR) + (
+    os.pathsep + existing_pythonpath if existing_pythonpath else ""
 )
 run(
     [
-        str(venv_python),
+        sys.executable,
         "-c",
         "import numpy, pandas; print('isolated numpy=', numpy.__version__, "
         "'pandas=', pandas.__version__)",
     ],
     cwd=REPO_DIR,
+    env=isolated_env,
 )
 
 if shutil.which("dot") is None:
@@ -96,7 +129,7 @@ if shutil.which("dot") is None:
 
 
 # ---------- 3. Run the engine in the isolated environment ----------
-engine_env = os.environ.copy()
+engine_env = isolated_env.copy()
 engine_env["PYTHONIOENCODING"] = "utf-8"
 if FRED_API_KEY.strip():
     engine_env["FRED_API_KEY"] = FRED_API_KEY.strip()
@@ -104,7 +137,7 @@ else:
     engine_env.pop("FRED_API_KEY", None)
     print("FRED_API_KEY is blank; using the official FRED public CSV endpoint.")
 
-run([str(venv_python), "a_share_risk_engine.py"], cwd=REPO_DIR, env=engine_env)
+run([sys.executable, "a_share_risk_engine.py"], cwd=REPO_DIR, env=engine_env)
 
 
 # ---------- 4. Render outputs with the untouched Colab kernel ----------
